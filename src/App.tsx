@@ -17,7 +17,7 @@ import 'leaflet/dist/leaflet.css';
 // ==========================================
 // Ganti string kosong di bawah dengan URL Web App Google Apps Script Anda saat siap integrasi.
 // Selama kosong, aplikasi berjalan di mode Sandbox (menggunakan LocalStorage)
-const GAS_API_URL = "";
+const GAS_API_URL = "https://script.google.com/macros/s/AKfycbw1WM795b0RuqMkb81m4GxBYsImwrfn9zwJYCq_scJp7e1rhIoZTZAkybXSwWiz9W7a/exec";
 
 // Jam masuk kantor standar, dipakai untuk menentukan status "Terlambat" pada absensi
 const JAM_MASUK_STANDAR = 8; // 08:00
