@@ -112,7 +112,19 @@ const db = {
     }
   }
 };
-
+const LogoIcon = ({ size = 24, className = '' }: { size?: number, className?: string }) => (
+  <svg width={size} height={size} viewBox="0 0 60 42" fill="none" xmlns="http://www.w3.org/2000/svg" className={className}>
+    <rect x="0" y="0" width="18" height="15" rx="2" stroke="currentColor" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
+    <circle cx="14" cy="32" r="8.5" stroke="currentColor" strokeWidth="4" />
+    <circle cx="52" cy="32" r="8.5" stroke="currentColor" strokeWidth="4" />
+    <path d="M14 32 L26 32 L36 15 L48 15" stroke="currentColor" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
+    <path d="M14 32 L18 15" stroke="currentColor" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
+    <path d="M30 22 L36 15" stroke="currentColor" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
+    <path d="M30 22 L38 22" stroke="currentColor" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
+    <path d="M48 15 L52 32" stroke="currentColor" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
+    <path d="M48 15 L58 15" stroke="currentColor" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
 const Card = ({ children, className = '' }: { children: React.ReactNode, className?: string }) => (
   <div className={`bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden ${className}`}>
     {children}
@@ -187,7 +199,7 @@ const LoginScreen = ({ onLogin, users }: { onLogin: (u: User) => void, users: Us
       <div className="w-full max-w-md">
         <div className="text-center mb-8">
           <div className="w-20 h-20 bg-blue-600 rounded-2xl flex items-center justify-center mx-auto shadow-xl shadow-blue-200 mb-4 transform rotate-3">
-            <span className="text-white text-3xl font-black -rotate-3">EKG</span>
+            <LogoIcon size={44} className="text-white -rotate-3" />
           </div>
           <h1 className="text-2xl font-bold text-slate-800">App Canvasing Es Garuda</h1>
           <p className="text-slate-500 mt-2">Sistem Monitoring Kunjungan & Prospek</p>
@@ -1181,7 +1193,7 @@ export default function App() {
         <aside className="bg-blue-700 text-white w-full md:w-64 flex-shrink-0 flex flex-col">
           <div className="p-6 flex items-center justify-between md:justify-center border-b border-blue-600">
             <div className="flex items-center gap-2">
-              <div className="w-8 h-8 bg-white rounded-lg flex items-center justify-center text-blue-700 font-bold">EKG</div>
+              <div className="w-8 h-8 bg-white rounded-lg flex items-center justify-center text-blue-700"><LogoIcon size={20} /></div>
               <span className="font-bold text-lg hidden md:block">Pusat Canvasing</span>
             </div>
             <button onClick={handleLogout} className="md:hidden p-2 text-blue-200 hover:text-white"><LogOut size={20} /></button>
@@ -1222,7 +1234,7 @@ export default function App() {
 
         <header className="bg-white px-4 py-3 flex items-center justify-between shadow-sm z-10 sticky top-0">
           <div className="flex items-center gap-2">
-            <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold text-xs">EKG</div>
+            <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white"><LogoIcon size={20} /></div>
             <span className="font-bold text-slate-800 text-sm">Canvasing Garuda</span>
           </div>
           <div className="flex items-center gap-3">
