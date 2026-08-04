@@ -4,7 +4,7 @@ import {
   BarChart3, Home, PlusCircle, History, TrendingUp,
   Map, UserPlus, FileText, AlertCircle,
   Edit, Trash2, Key, Shield, Info, X, Power, PowerOff, RefreshCw, Store,
-  Clock, ExternalLink, Download, Image as ImageIcon, LogIn, WifiOff
+  Clock, ExternalLink, Download, Image as ImageIcon, LogIn, WifiOff, Target as TargetIcon
 } from 'lucide-react';
 
 // AdminDashboard (pakai recharts) dan AdminMap (pakai leaflet) sengaja
@@ -13,16 +13,14 @@ import {
 // tidak perlu mengunduh kedua library berat ini sama sekali.
 const AdminDashboard = lazy(() => import('./admin/AdminDashboard'));
 const AdminMap = lazy(() => import('./admin/AdminMap'));
+const AdminTargets = lazy(() => import('./admin/AdminTargets'));
 
 // ==========================================
 // KONFIGURASI API GOOGLE APPS SCRIPT
 // ==========================================
 // Ganti string kosong di bawah dengan URL Web App Google Apps Script Anda saat siap integrasi.
 // Selama kosong, aplikasi berjalan di mode Sandbox (menggunakan LocalStorage)
-const GAS_API_URL = "https://script.google.com/macros/s/AKfycbw1WM795b0RuqMkb81m4GxBYsImwrfn9zwJYCq_scJp7e1rhIoZTZAkybXSwWiz9W7a/exec";
-
-// Jam masuk kantor standar, dipakai untuk menentukan status "Terlambat" pada absensi
-const JAM_MASUK_STANDAR = 8; // 08:00
+const GAS_API_URL = "";
 
 type Role = 'admin' | 'pegawai' | 'owner';
 
@@ -68,7 +66,47 @@ interface Attendance {
   checkOutTime?: string;
   checkOutLat?: number | null;
   checkOutLng?: number | null;
-  status: 'Tepat Waktu' | 'Terlambat';
+  status: 'Tepat Waktu' | 'Terlambat' | 'Tidak Valid';
+}
+
+// Pengaturan jadwal absensi - bisa diubah Admin lewat menu Pengaturan Absensi
+interface AttendanceSettings {
+  checkInStart: string;   // jam mulai boleh absen masuk, format "HH:mm"
+  checkInEnd: string;     // batas akhir absen masuk
+  checkOutStart: string;  // jam mulai boleh absen pulang
+  checkOutEnd: string;    // batas akhir absen pulang
+  toleranceMinutes: number; // toleransi keterlambatan (menit) sebelum status jadi "Terlambat"
+  activeDays: string[];   // hari kerja aktif, cth: ['Senin','Selasa','Rabu','Kamis','Jumat','Sabtu']
+  isActive: boolean;      // kalau dimatikan, absen tidak dibatasi jadwal sama sekali
+}
+
+const defaultAttendanceSettings: AttendanceSettings = {
+  checkInStart: '07:00',
+  checkInEnd: '09:00',
+  checkOutStart: '16:00',
+  checkOutEnd: '20:00',
+  toleranceMinutes: 15,
+  activeDays: ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'],
+  isActive: true,
+};
+
+const DAY_NAMES_ID = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+
+function timeToMinutes(t: string): number {
+  const [h, m] = t.split(':').map(Number);
+  return (h || 0) * 60 + (m || 0);
+}
+
+// Target Canvasing - dibuat Admin, bisa untuk 1 pegawai atau seluruh cabang/depot
+interface Target {
+  id: string;
+  scope: 'pegawai' | 'cabang';
+  scopeId: string;        // ID pegawai kalau scope='pegawai', atau nama cabang kalau scope='cabang'
+  scopeLabel: string;     // nama yang ditampilkan (nama pegawai / nama cabang)
+  period: 'harian' | 'mingguan' | 'bulanan';
+  startDate: string;      // tanggal acuan periode berlaku, format "YYYY-MM-DD"
+  visitTarget: number;
+  newCustomerTarget: number;
 }
 
 const defaultUsers: User[] = [
@@ -84,6 +122,7 @@ const defaultVisits: Visit[] = [
 ];
 
 const defaultAttendance: Attendance[] = [];
+const defaultTargets: Target[] = [];
 
 const FETCH_TIMEOUT_MS = 10000;
 const MAX_RETRY = 2;
@@ -201,6 +240,7 @@ const Input = ({ label, type = 'text', value, onChange, placeholder, required = 
       {Icon && <Icon className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 w-5 h-5" />}
       <input
         type={type} value={value} onChange={onChange} placeholder={placeholder} required={required} minLength={minLength}
+        autoCapitalize="off" autoCorrect="off" spellCheck={false}
         className={`w-full bg-slate-50 border border-slate-200 text-slate-800 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all ${Icon ? 'pl-10' : ''}`}
       />
     </div>
@@ -229,8 +269,10 @@ const LoginScreen = ({ onLogin, users }: { onLogin: (u: User) => void, users: Us
 
   const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
-    const user = users.find(u => u.id === id);
-    if (user && user.password === password) {
+    const typedId = id.trim().toUpperCase();
+    const typedPassword = password.trim();
+    const user = users.find(u => u.id.trim().toUpperCase() === typedId);
+    if (user && user.password === typedPassword) {
       if (user.status === 'Nonaktif') {
         setError('Akun Anda dinonaktifkan oleh Admin.');
       } else {
@@ -267,10 +309,10 @@ const LoginScreen = ({ onLogin, users }: { onLogin: (u: User) => void, users: Us
 };
 
 const PegawaiDashboard = ({
-  user, visits, attendanceToday, onCheckIn, onCheckOut, attendanceLoading
+  user, visits, attendanceToday, onCheckIn, onCheckOut, attendanceLoading, attendanceSettings
 }: {
   user: User, visits: Visit[], attendanceToday: Attendance | null,
-  onCheckIn: () => void, onCheckOut: () => void, attendanceLoading: boolean
+  onCheckIn: () => void, onCheckOut: () => void, attendanceLoading: boolean, attendanceSettings: AttendanceSettings
 }) => {
   const myVisits = visits.filter(v => v.pegawaiId === user.id);
   const todayDate = new Date().toISOString().split('T')[0];
@@ -281,6 +323,28 @@ const PegawaiDashboard = ({
 
   const progressVisits = Math.min(100, Math.round((myVisits.length / targetVisits) * 100));
   const progressNew = Math.min(100, Math.round((newCustomers / targetNew) * 100));
+
+  // Hitung status jadwal absen saat ini supaya pegawai lihat info-nya
+  // tanpa harus klik tombol dulu.
+  const now = new Date();
+  const nowMinutes = now.getHours() * 60 + now.getMinutes();
+  const todayName = DAY_NAMES_ID[now.getDay()];
+  let scheduleHint: string | null = null;
+  if (attendanceSettings.isActive) {
+    if (!attendanceSettings.activeDays.includes(todayName)) {
+      scheduleHint = `Hari ini (${todayName}) bukan hari kerja aktif untuk absensi.`;
+    } else if (!attendanceToday) {
+      const startMinutes = timeToMinutes(attendanceSettings.checkInStart);
+      const endMinutes = timeToMinutes(attendanceSettings.checkInEnd);
+      if (nowMinutes < startMinutes) scheduleHint = `Absen masuk dibuka mulai pukul ${attendanceSettings.checkInStart}.`;
+      else if (nowMinutes > endMinutes) scheduleHint = `Absen masuk sudah ditutup (batas ${attendanceSettings.checkInEnd}).`;
+    } else if (!attendanceToday.checkOutTime) {
+      const startMinutes = timeToMinutes(attendanceSettings.checkOutStart);
+      const endMinutes = timeToMinutes(attendanceSettings.checkOutEnd);
+      if (nowMinutes < startMinutes) scheduleHint = `Absen pulang dibuka mulai pukul ${attendanceSettings.checkOutStart}.`;
+      else if (nowMinutes > endMinutes) scheduleHint = `Absen pulang sudah ditutup (batas ${attendanceSettings.checkOutEnd}).`;
+    }
+  }
 
   return (
     <div className="p-4 space-y-6 pb-24">
@@ -316,6 +380,11 @@ const PegawaiDashboard = ({
 
       <Card className="p-4">
         <h3 className="font-bold text-slate-800 mb-3 flex items-center gap-2"><Clock size={18} className="text-blue-600" /> Absensi Hari Ini</h3>
+        {scheduleHint && (
+          <div className="flex items-center gap-2 text-xs font-medium text-slate-500 bg-slate-50 border border-slate-100 p-2.5 rounded-lg mb-3">
+            <Info size={14} className="flex-shrink-0" /> {scheduleHint}
+          </div>
+        )}
         {!attendanceToday ? (
           <Button variant="primary" onClick={onCheckIn} disabled={attendanceLoading}>
             <LogIn size={18} /> {attendanceLoading ? 'Mengambil Lokasi GPS...' : 'Absen Masuk'}
@@ -538,8 +607,84 @@ const CanvassingForm = ({ user, onSubmit }: { user: User, onSubmit: (v: any) => 
   );
 };
 
-const AdminAttendance = ({ attendance, users }: { attendance: Attendance[], users: User[] }) => {
+const ALL_DAY_NAMES = ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu', 'Minggu'];
+
+const AttendanceScheduleForm = ({ settings, onSave }: { settings: AttendanceSettings, onSave: (s: AttendanceSettings) => void }) => {
+  const [form, setForm] = useState<AttendanceSettings>(settings);
+  const [saved, setSaved] = useState(false);
+
+  const toggleDay = (day: string) => {
+    setForm((prev) => ({
+      ...prev,
+      activeDays: prev.activeDays.includes(day)
+        ? prev.activeDays.filter((d) => d !== day)
+        : [...prev.activeDays, day],
+    }));
+  };
+
+  const handleSave = (e: React.FormEvent) => {
+    e.preventDefault();
+    onSave(form);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2500);
+  };
+
+  return (
+    <form onSubmit={handleSave} className="space-y-4">
+      <Card className="p-5">
+        <div className="flex items-center justify-between mb-4 pb-3 border-b">
+          <div>
+            <h3 className="font-bold text-slate-800">Status Aturan Jadwal</h3>
+            <p className="text-xs text-slate-500 mt-0.5">Kalau dimatikan, pegawai bisa absen kapan saja tanpa batasan jam.</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setForm({ ...form, isActive: !form.isActive })}
+            className={`px-4 py-2 rounded-xl font-semibold text-sm flex items-center gap-2 ${form.isActive ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-500'}`}
+          >
+            {form.isActive ? <Power size={16} /> : <PowerOff size={16} />}
+            {form.isActive ? 'Aktif' : 'Nonaktif'}
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4">
+          <Input label="Jam Masuk" type="time" value={form.checkInStart} onChange={(e: any) => setForm({ ...form, checkInStart: e.target.value })} required />
+          <Input label="Batas Akhir Jam Masuk" type="time" value={form.checkInEnd} onChange={(e: any) => setForm({ ...form, checkInEnd: e.target.value })} required />
+          <Input label="Jam Pulang" type="time" value={form.checkOutStart} onChange={(e: any) => setForm({ ...form, checkOutStart: e.target.value })} required />
+          <Input label="Batas Akhir Jam Pulang" type="time" value={form.checkOutEnd} onChange={(e: any) => setForm({ ...form, checkOutEnd: e.target.value })} required />
+        </div>
+        <Input
+          label="Toleransi Keterlambatan (menit)" type="number" value={form.toleranceMinutes}
+          onChange={(e: any) => setForm({ ...form, toleranceMinutes: Math.max(0, Number(e.target.value)) })}
+        />
+
+        <div className="mb-2">
+          <label className="block text-sm font-medium text-slate-600 mb-2">Hari Kerja Aktif</label>
+          <div className="flex flex-wrap gap-2">
+            {ALL_DAY_NAMES.map((day) => (
+              <button
+                type="button" key={day} onClick={() => toggleDay(day)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold border ${form.activeDays.includes(day) ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-slate-500 border-slate-200'}`}
+              >
+                {day}
+              </button>
+            ))}
+          </div>
+        </div>
+      </Card>
+
+      <Button type="submit" variant="primary">{saved ? 'Tersimpan ✓' : 'Simpan Pengaturan Jadwal'}</Button>
+    </form>
+  );
+};
+
+const AdminAttendance = ({
+  attendance, users, attendanceSettings, onUpdateSettings
+}: {
+  attendance: Attendance[], users: User[], attendanceSettings: AttendanceSettings, onUpdateSettings: (s: AttendanceSettings) => void
+}) => {
   const todayStr = new Date().toISOString().split('T')[0];
+  const [innerTab, setInnerTab] = useState<'rekap' | 'jadwal'>('rekap');
   const [filterCabang, setFilterCabang] = useState('Semua');
   const [filterDate, setFilterDate] = useState(todayStr);
 
@@ -570,79 +715,90 @@ const AdminAttendance = ({ attendance, users }: { attendance: Attendance[], user
         <p className="text-slate-500">Rekap kehadiran pegawai lapangan berbasis GPS.</p>
       </div>
 
-      <Card className="p-5">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <Select label="Filter Cabang" value={filterCabang} onChange={(e: any) => setFilterCabang(e.target.value)} options={cabangList} />
-          <Input label="Tanggal" type="date" value={filterDate} onChange={(e: any) => setFilterDate(e.target.value)} />
-          <div className="flex items-end pb-4">
-            <Button variant="outline" className="w-full" onClick={() => { setFilterCabang('Semua'); setFilterDate(todayStr); }}>Reset ke Hari Ini</Button>
-          </div>
-        </div>
-      </Card>
-
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        <Card className="p-6 border-l-4 border-l-emerald-500">
-          <p className="text-slate-500 text-sm font-medium">Hadir</p>
-          <p className="text-3xl font-black text-slate-800 mt-2">{hadirCount}</p>
-        </Card>
-        <Card className="p-6 border-l-4 border-l-yellow-500">
-          <p className="text-slate-500 text-sm font-medium">Terlambat</p>
-          <p className="text-3xl font-black text-slate-800 mt-2">{terlambatCount}</p>
-        </Card>
-        <Card className="p-6 border-l-4 border-l-red-500">
-          <p className="text-slate-500 text-sm font-medium">Belum Absen</p>
-          <p className="text-3xl font-black text-slate-800 mt-2">{belumAbsenCount}</p>
-        </Card>
+      <div className="flex gap-2 bg-slate-100 p-1 rounded-xl w-fit">
+        <button onClick={() => setInnerTab('rekap')} className={`px-4 py-2 rounded-lg text-sm font-semibold ${innerTab === 'rekap' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500'}`}>Rekap Kehadiran</button>
+        <button onClick={() => setInnerTab('jadwal')} className={`px-4 py-2 rounded-lg text-sm font-semibold ${innerTab === 'jadwal' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500'}`}>Pengaturan Jadwal</button>
       </div>
 
-      <Card className="p-0 overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-sm whitespace-nowrap">
-            <thead className="bg-slate-100 text-slate-600 font-medium">
-              <tr>
-                <th className="p-4">Nama Pegawai</th>
-                <th className="p-4">Cabang</th>
-                <th className="p-4">Jam Masuk</th>
-                <th className="p-4">Status</th>
-                <th className="p-4">Jam Pulang</th>
-                <th className="p-4 text-center">Lokasi</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100">
-              {activePegawai.map(u => {
-                const rec = dayRecords.find(a => a.pegawaiId === u.id);
-                return (
-                  <tr key={u.id} className="hover:bg-slate-50 transition-colors">
-                    <td className="p-4 font-semibold text-slate-800">{u.name}</td>
-                    <td className="p-4 text-slate-600">{u.cabang}</td>
-                    <td className="p-4 text-slate-600">{rec ? rec.checkInTime : '-'}</td>
-                    <td className="p-4">
-                      {rec ? (
-                        <span className={`px-3 py-1 rounded-full text-xs font-bold ${rec.status === 'Terlambat' ? 'bg-yellow-100 text-yellow-700' : 'bg-emerald-100 text-emerald-700'}`}>
-                          {rec.status}
-                        </span>
-                      ) : (
-                        <span className="px-3 py-1 rounded-full text-xs font-bold bg-red-100 text-red-700">Belum Absen</span>
-                      )}
-                    </td>
-                    <td className="p-4 text-slate-600">{rec?.checkOutTime || (rec ? 'Belum Pulang' : '-')}</td>
-                    <td className="p-4 text-center">
-                      {rec ? (
-                        <button onClick={() => openInGoogleMaps(rec.checkInLat, rec.checkInLng)} className="p-2 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 inline-flex" title="Lihat lokasi absen masuk">
-                          <ExternalLink size={16} />
-                        </button>
-                      ) : '-'}
-                    </td>
+      {innerTab === 'jadwal' ? (
+        <AttendanceScheduleForm settings={attendanceSettings} onSave={onUpdateSettings} />
+      ) : (
+        <>
+          <Card className="p-5">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <Select label="Filter Cabang" value={filterCabang} onChange={(e: any) => setFilterCabang(e.target.value)} options={cabangList} />
+              <Input label="Tanggal" type="date" value={filterDate} onChange={(e: any) => setFilterDate(e.target.value)} />
+              <div className="flex items-end pb-4">
+                <Button variant="outline" className="w-full" onClick={() => { setFilterCabang('Semua'); setFilterDate(todayStr); }}>Reset ke Hari Ini</Button>
+              </div>
+            </div>
+          </Card>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <Card className="p-6 border-l-4 border-l-emerald-500">
+              <p className="text-slate-500 text-sm font-medium">Hadir</p>
+              <p className="text-3xl font-black text-slate-800 mt-2">{hadirCount}</p>
+            </Card>
+            <Card className="p-6 border-l-4 border-l-yellow-500">
+              <p className="text-slate-500 text-sm font-medium">Terlambat</p>
+              <p className="text-3xl font-black text-slate-800 mt-2">{terlambatCount}</p>
+            </Card>
+            <Card className="p-6 border-l-4 border-l-red-500">
+              <p className="text-slate-500 text-sm font-medium">Belum Absen</p>
+              <p className="text-3xl font-black text-slate-800 mt-2">{belumAbsenCount}</p>
+            </Card>
+          </div>
+
+          <Card className="p-0 overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm whitespace-nowrap">
+                <thead className="bg-slate-100 text-slate-600 font-medium">
+                  <tr>
+                    <th className="p-4">Nama Pegawai</th>
+                    <th className="p-4">Cabang</th>
+                    <th className="p-4">Jam Masuk</th>
+                    <th className="p-4">Status</th>
+                    <th className="p-4">Jam Pulang</th>
+                    <th className="p-4 text-center">Lokasi</th>
                   </tr>
-                );
-              })}
-              {activePegawai.length === 0 && (
-                <tr><td colSpan={6} className="p-6 text-center text-slate-400">Belum ada pegawai aktif untuk cabang ini.</td></tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      </Card>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {activePegawai.map(u => {
+                    const rec = dayRecords.find(a => a.pegawaiId === u.id);
+                    return (
+                      <tr key={u.id} className="hover:bg-slate-50 transition-colors">
+                        <td className="p-4 font-semibold text-slate-800">{u.name}</td>
+                        <td className="p-4 text-slate-600">{u.cabang}</td>
+                        <td className="p-4 text-slate-600">{rec ? rec.checkInTime : '-'}</td>
+                        <td className="p-4">
+                          {rec ? (
+                            <span className={`px-3 py-1 rounded-full text-xs font-bold ${rec.status === 'Terlambat' ? 'bg-yellow-100 text-yellow-700' : rec.status === 'Tidak Valid' ? 'bg-slate-200 text-slate-600' : 'bg-emerald-100 text-emerald-700'}`}>
+                              {rec.status}
+                            </span>
+                          ) : (
+                            <span className="px-3 py-1 rounded-full text-xs font-bold bg-red-100 text-red-700">Belum Absen</span>
+                          )}
+                        </td>
+                        <td className="p-4 text-slate-600">{rec?.checkOutTime || (rec ? 'Belum Pulang' : '-')}</td>
+                        <td className="p-4 text-center">
+                          {rec ? (
+                            <button onClick={() => openInGoogleMaps(rec.checkInLat, rec.checkInLng)} className="p-2 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 inline-flex" title="Lihat lokasi absen masuk">
+                              <ExternalLink size={16} />
+                            </button>
+                          ) : '-'}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {activePegawai.length === 0 && (
+                    <tr><td colSpan={6} className="p-6 text-center text-slate-400">Belum ada pegawai aktif untuk cabang ini.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        </>
+      )}
     </div>
   );
 };
@@ -810,8 +966,10 @@ export default function App() {
   const [users, setUsers] = useState<User[]>([]);
   const [visits, setVisits] = useState<Visit[]>([]);
   const [attendance, setAttendance] = useState<Attendance[]>([]);
+  const [targets, setTargets] = useState<Target[]>([]);
+  const [attendanceSettings, setAttendanceSettings] = useState<AttendanceSettings>(defaultAttendanceSettings);
   const [currentTab, setCurrentTab] = useState<'home' | 'canvassing' | 'history'>('home');
-  const [adminTab, setAdminTab] = useState<'dashboard' | 'map' | 'employees' | 'attendance'>('dashboard');
+  const [adminTab, setAdminTab] = useState<'dashboard' | 'map' | 'employees' | 'attendance' | 'targets'>('dashboard');
   const [auditLogs, setAuditLogs] = useState<any[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [initialized, setInitialized] = useState(false);
@@ -837,16 +995,18 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    // Ambil data users, visits, dan attendance SEKALIGUS secara paralel
-    // (bukan satu-satu berurutan) supaya total waktu tunggu jauh lebih singkat,
-    // terutama kalau sumber datanya Google Sheets/Apps Script.
+    // Ambil data users, visits, attendance, settings, dan targets SEKALIGUS
+    // secara paralel (bukan satu-satu berurutan) supaya total waktu tunggu
+    // jauh lebih singkat, terutama kalau sumber datanya Google Sheets/Apps Script.
     setSyncing(true);
     const usersPromise = db.get('users');
     const visitsPromise = db.get('visits');
     const attendancePromise = db.get('attendance');
+    const settingsPromise = db.get('settings');
+    const targetsPromise = db.get('targets');
 
     // Layar login cuma butuh data 'users', jadi begitu itu selesai,
-    // langsung tampilkan layar login tanpa menunggu data kunjungan & absensi.
+    // langsung tampilkan layar login tanpa menunggu data lainnya.
     usersPromise.then((loadedUsers) => {
       const finalUsers = loadedUsers.length > 0 ? loadedUsers : defaultUsers;
       setUsers(finalUsers);
@@ -867,8 +1027,14 @@ export default function App() {
     attendancePromise.then((loadedAttendance) => {
       setAttendance(loadedAttendance || []);
     });
+    settingsPromise.then((loadedSettings) => {
+      setAttendanceSettings(loadedSettings && loadedSettings.length > 0 ? loadedSettings[0] : defaultAttendanceSettings);
+    });
+    targetsPromise.then((loadedTargets) => {
+      setTargets(loadedTargets || []);
+    });
 
-    Promise.allSettled([usersPromise, visitsPromise, attendancePromise]).then(() => setSyncing(false));
+    Promise.allSettled([usersPromise, visitsPromise, attendancePromise, settingsPromise, targetsPromise]).then(() => setSyncing(false));
   }, []);
 
   const syncToDB = async (collection: string, data: any) => {
@@ -880,6 +1046,16 @@ export default function App() {
   const handleUsersUpdate = (newUsers: User[]) => {
     setUsers(newUsers);
     syncToDB('users', newUsers);
+  };
+
+  const handleUpdateAttendanceSettings = (newSettings: AttendanceSettings) => {
+    setAttendanceSettings(newSettings);
+    syncToDB('settings', [newSettings]);
+  };
+
+  const handleUpdateTargets = (newTargets: Target[]) => {
+    setTargets(newTargets);
+    syncToDB('targets', newTargets);
   };
 
   const addAuditLog = (action: string, detail: string) => {
@@ -921,12 +1097,38 @@ export default function App() {
   const handleCheckIn = () => {
     if (!user) return;
     if (!('geolocation' in navigator)) { alert('Browser tidak mendukung GPS.'); return; }
+
+    if (attendanceSettings.isActive) {
+      const now = new Date();
+      const todayName = DAY_NAMES_ID[now.getDay()];
+      if (!attendanceSettings.activeDays.includes(todayName)) {
+        alert(`Hari ini (${todayName}) bukan hari kerja aktif untuk absensi.`);
+        return;
+      }
+      const nowMinutes = now.getHours() * 60 + now.getMinutes();
+      const startMinutes = timeToMinutes(attendanceSettings.checkInStart);
+      const endMinutes = timeToMinutes(attendanceSettings.checkInEnd);
+      if (nowMinutes < startMinutes) {
+        alert(`Waktu absensi masuk belum dibuka. Absen masuk dibuka mulai pukul ${attendanceSettings.checkInStart}.`);
+        return;
+      }
+      if (nowMinutes > endMinutes) {
+        alert(`Waktu absensi masuk sudah ditutup (batas ${attendanceSettings.checkInEnd}). Hubungi Admin kalau ada kendala.`);
+        return;
+      }
+    }
+
     setAttendanceLoading(true);
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         const now = new Date();
         const timeStr = now.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
-        const isLate = now.getHours() > JAM_MASUK_STANDAR || (now.getHours() === JAM_MASUK_STANDAR && now.getMinutes() > 0);
+        let status: Attendance['status'] = 'Tepat Waktu';
+        if (attendanceSettings.isActive) {
+          const nowMinutes = now.getHours() * 60 + now.getMinutes();
+          const startMinutes = timeToMinutes(attendanceSettings.checkInStart);
+          status = nowMinutes > startMinutes + attendanceSettings.toleranceMinutes ? 'Terlambat' : 'Tepat Waktu';
+        }
         const newAtt: Attendance = {
           id: Date.now().toString(),
           pegawaiId: user.id,
@@ -934,7 +1136,7 @@ export default function App() {
           checkInTime: timeStr,
           checkInLat: pos.coords.latitude,
           checkInLng: pos.coords.longitude,
-          status: isLate ? 'Terlambat' : 'Tepat Waktu',
+          status,
         };
         const updated = [newAtt, ...attendance];
         setAttendance(updated);
@@ -949,6 +1151,22 @@ export default function App() {
   const handleCheckOut = () => {
     if (!user || !attendanceToday) return;
     if (!('geolocation' in navigator)) { alert('Browser tidak mendukung GPS.'); return; }
+
+    if (attendanceSettings.isActive) {
+      const now = new Date();
+      const nowMinutes = now.getHours() * 60 + now.getMinutes();
+      const startMinutes = timeToMinutes(attendanceSettings.checkOutStart);
+      const endMinutes = timeToMinutes(attendanceSettings.checkOutEnd);
+      if (nowMinutes < startMinutes) {
+        alert(`Waktu absensi pulang belum dibuka. Absen pulang dibuka mulai pukul ${attendanceSettings.checkOutStart}.`);
+        return;
+      }
+      if (nowMinutes > endMinutes) {
+        alert(`Waktu absensi pulang sudah ditutup (batas ${attendanceSettings.checkOutEnd}). Hubungi Admin kalau ada kendala.`);
+        return;
+      }
+    }
+
     setAttendanceLoading(true);
     navigator.geolocation.getCurrentPosition(
       (pos) => {
@@ -986,6 +1204,7 @@ export default function App() {
             <button onClick={() => setAdminTab('dashboard')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'dashboard' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><BarChart3 size={20} /> Dashboard Kunjungan</button>
             <button onClick={() => setAdminTab('map')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'map' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><Map size={20} /> Peta Wilayah GPS</button>
             <button onClick={() => setAdminTab('attendance')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'attendance' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><Clock size={20} /> Absensi Karyawan</button>
+            <button onClick={() => setAdminTab('targets')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'targets' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><TargetIcon size={20} /> Target Canvasing</button>
             <button onClick={() => setAdminTab('employees')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'employees' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><Users size={20} /> Kelola Akun Pegawai</button>
           </nav>
           <div className="p-4 hidden md:block border-t border-blue-600">
@@ -1006,8 +1225,9 @@ export default function App() {
           <Suspense fallback={<AdminSectionLoading />}>
             {adminTab === 'dashboard' && <AdminDashboard visits={visits} users={users} />}
             {adminTab === 'map' && <AdminMap visits={visits} users={users} />}
+            {adminTab === 'targets' && <AdminTargets visits={visits} users={users} targets={targets} onUpdateTargets={handleUpdateTargets} />}
           </Suspense>
-          {adminTab === 'attendance' && <AdminAttendance attendance={attendance} users={users} />}
+          {adminTab === 'attendance' && <AdminAttendance attendance={attendance} users={users} attendanceSettings={attendanceSettings} onUpdateSettings={handleUpdateAttendanceSettings} />}
           {adminTab === 'employees' && <AdminEmployees users={users} setUsers={handleUsersUpdate} addAuditLog={addAuditLog} />}
         </main>
 
@@ -1024,6 +1244,10 @@ export default function App() {
           <button onClick={() => setAdminTab('attendance')} className={`flex flex-col items-center gap-1 p-2 flex-1 transition-colors ${adminTab === 'attendance' ? 'text-blue-600' : 'text-slate-400'}`}>
             <Clock size={22} />
             <span className="text-[10px] font-medium">Absensi</span>
+          </button>
+          <button onClick={() => setAdminTab('targets')} className={`flex flex-col items-center gap-1 p-2 flex-1 transition-colors ${adminTab === 'targets' ? 'text-blue-600' : 'text-slate-400'}`}>
+            <TargetIcon size={22} />
+            <span className="text-[10px] font-medium">Target</span>
           </button>
           <button onClick={() => setAdminTab('employees')} className={`flex flex-col items-center gap-1 p-2 flex-1 transition-colors ${adminTab === 'employees' ? 'text-blue-600' : 'text-slate-400'}`}>
             <Users size={22} />
@@ -1061,6 +1285,7 @@ export default function App() {
               onCheckIn={handleCheckIn}
               onCheckOut={handleCheckOut}
               attendanceLoading={attendanceLoading}
+              attendanceSettings={attendanceSettings}
             />
           )}
           {currentTab === 'canvassing' && <CanvassingForm user={user} onSubmit={handleAddVisit} />}
