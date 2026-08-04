@@ -3,7 +3,7 @@
 // (2) menyimpan cache dasar supaya aplikasi tetap bisa terbuka
 // walau sinyal internet sedang lemah/putus sesaat.
 
-const CACHE_NAME = 'ekg-canvasing-v1';
+const CACHE_NAME = 'ekg-canvasing-v2';
 const APP_SHELL = [
   '/',
   '/index.html',

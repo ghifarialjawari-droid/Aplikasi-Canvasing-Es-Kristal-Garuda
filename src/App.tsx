@@ -1,23 +1,25 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, lazy, Suspense } from 'react';
 import {
   MapPin, Camera, CheckCircle, LogOut, Users,
   BarChart3, Home, PlusCircle, History, TrendingUp,
   Map, UserPlus, FileText, AlertCircle,
   Edit, Trash2, Key, Shield, Info, X, Power, PowerOff, RefreshCw, Store,
-  Clock, ExternalLink, Download, Image as ImageIcon, LogIn
+  Clock, ExternalLink, Download, Image as ImageIcon, LogIn, WifiOff
 } from 'lucide-react';
-import {
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
-} from 'recharts';
-import L from 'leaflet';
-import 'leaflet/dist/leaflet.css';
+
+// AdminDashboard (pakai recharts) dan AdminMap (pakai leaflet) sengaja
+// dimuat "lazy" - hanya di-download saat Admin benar-benar membuka halaman
+// itu. Pegawai (yang jumlahnya lebih banyak & sering buka dari HP) jadi
+// tidak perlu mengunduh kedua library berat ini sama sekali.
+const AdminDashboard = lazy(() => import('./admin/AdminDashboard'));
+const AdminMap = lazy(() => import('./admin/AdminMap'));
 
 // ==========================================
 // KONFIGURASI API GOOGLE APPS SCRIPT
 // ==========================================
 // Ganti string kosong di bawah dengan URL Web App Google Apps Script Anda saat siap integrasi.
 // Selama kosong, aplikasi berjalan di mode Sandbox (menggunakan LocalStorage)
-const GAS_API_URL = "https://script.google.com/macros/s/AKfycbw1WM795b0RuqMkb81m4GxBYsImwrfn9zwJYCq_scJp7e1rhIoZTZAkybXSwWiz9W7a/exec";
+const GAS_API_URL = "";
 
 // Jam masuk kantor standar, dipakai untuk menentukan status "Terlambat" pada absensi
 const JAM_MASUK_STANDAR = 8; // 08:00
@@ -83,13 +85,40 @@ const defaultVisits: Visit[] = [
 
 const defaultAttendance: Attendance[] = [];
 
+const FETCH_TIMEOUT_MS = 10000;
+const MAX_RETRY = 2;
+
+function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer));
+}
+
+async function fetchWithRetry(url: string, options: RequestInit = {}, retriesLeft = MAX_RETRY): Promise<Response> {
+  try {
+    return await fetchWithTimeout(url, options);
+  } catch (err) {
+    if (retriesLeft > 0) {
+      await new Promise((r) => setTimeout(r, 800));
+      return fetchWithRetry(url, options, retriesLeft - 1);
+    }
+    throw err;
+  }
+}
+
 const db = {
   async get(collection: string) {
     if (GAS_API_URL) {
       try {
-        const res = await fetch(`${GAS_API_URL}?action=get&collection=${collection}`);
+        const res = await fetchWithRetry(`${GAS_API_URL}?action=get&collection=${collection}`);
         return await res.json();
-      } catch (err) { console.error('API Error:', err); return []; }
+      } catch (err) {
+        console.error('API Error (get):', err);
+        // Kalau gagal total (offline/timeout setelah beberapa kali coba),
+        // pakai salinan cadangan terakhir yang tersimpan di HP ini.
+        const cached = localStorage.getItem(`esgaruda_cache_${collection}`);
+        return cached ? JSON.parse(cached) : [];
+      }
     } else {
       const data = localStorage.getItem(`esgaruda_${collection}`);
       if (data) return JSON.parse(data);
@@ -100,18 +129,26 @@ const db = {
     }
   },
   async save(collection: string, data: any) {
+    // Simpan salinan cadangan di HP ini juga, supaya data tidak hilang
+    // kalau koneksi ke server terputus saat menyimpan.
+    localStorage.setItem(`esgaruda_cache_${collection}`, JSON.stringify(data));
+
     if (GAS_API_URL) {
       try {
-        await fetch(GAS_API_URL, {
+        await fetchWithRetry(GAS_API_URL, {
           method: 'POST',
           body: JSON.stringify({ action: 'save', collection, data }),
         });
-      } catch (err) { console.error('API Error:', err); }
+      } catch (err) {
+        console.error('API Error (save):', err);
+      }
     } else {
       localStorage.setItem(`esgaruda_${collection}`, JSON.stringify(data));
     }
   }
 };
+
+// Logo motor kurir - dipakai di layar login, sidebar admin, dan header pegawai
 const LogoIcon = ({ size = 24, className = '' }: { size?: number, className?: string }) => (
   <svg width={size} height={size} viewBox="0 0 60 42" fill="none" xmlns="http://www.w3.org/2000/svg" className={className}>
     <rect x="0" y="0" width="18" height="15" rx="2" stroke="currentColor" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
@@ -125,6 +162,16 @@ const LogoIcon = ({ size = 24, className = '' }: { size?: number, className?: st
     <path d="M48 15 L58 15" stroke="currentColor" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
   </svg>
 );
+
+const AdminSectionLoading = () => (
+  <div className="p-6 md:p-8 min-h-screen flex items-center justify-center bg-slate-50">
+    <div className="flex flex-col items-center gap-3 text-slate-400">
+      <RefreshCw size={28} className="animate-spin" />
+      <span className="text-sm font-medium">Memuat halaman...</span>
+    </div>
+  </div>
+);
+
 const Card = ({ children, className = '' }: { children: React.ReactNode, className?: string }) => (
   <div className={`bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden ${className}`}>
     {children}
@@ -491,320 +538,6 @@ const CanvassingForm = ({ user, onSubmit }: { user: User, onSubmit: (v: any) => 
   );
 };
 
-const AdminDashboard = ({ visits, users }: { visits: Visit[], users: User[] }) => {
-  const [selectedCabang, setSelectedCabang] = useState('Semua');
-
-  const cabangList = ['Semua', ...Array.from(new Set(users.filter(u => u.role === 'pegawai').map(u => u.cabang)))];
-
-  const filteredVisits = selectedCabang === 'Semua' ? visits : visits.filter(v => v.cabang === selectedCabang);
-  const activeEmployees = users.filter(u => u.role === 'pegawai' && u.status === 'Aktif' && (selectedCabang === 'Semua' || u.cabang === selectedCabang)).length;
-
-  const totalVisits = filteredVisits.length;
-  const newShops = filteredVisits.filter(v => v.isNewCustomer).length;
-  const totalProspek = filteredVisits.filter(v => v.status === 'Prospek' || v.status === 'Follow Up').length;
-
-  const ranking = [...users.filter(u => u.role === 'pegawai' && u.status === 'Aktif' && (selectedCabang === 'Semua' || u.cabang === selectedCabang))].map(user => {
-    const userVisits = filteredVisits.filter(v => v.pegawaiId === user.id);
-    const tokoBaru = userVisits.filter(v => v.isNewCustomer).length;
-    return { name: user.name, cabang: user.cabang, visits: userVisits.length, tokoBaru };
-  }).sort((a, b) => b.visits - a.visits);
-
-  // Data trend 7 hari terakhir dihitung dari data kunjungan asli (bukan simulasi)
-  const dayNames = ['Min', 'Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab'];
-  const chartData = Array.from({ length: 7 }).map((_, idx) => {
-    const d = new Date();
-    d.setDate(d.getDate() - (6 - idx));
-    const dateStr = d.toISOString().split('T')[0];
-    const dayVisits = filteredVisits.filter(v => v.date === dateStr);
-    return {
-      name: dayNames[d.getDay()],
-      kunjungan: dayVisits.length,
-      tokoBaru: dayVisits.filter(v => v.isNewCustomer).length
-    };
-  });
-
-  const handleExport = () => {
-    const headers = ['Tanggal', 'Waktu', 'Nama Toko', 'Pemilik', 'No HP', 'Jenis Usaha', 'Cabang', 'Status', 'Toko Baru', 'Sales', 'Catatan'];
-    const rows = filteredVisits.map(v => {
-      const peg = users.find(u => u.id === v.pegawaiId);
-      const catatan = (v.result || '').replace(/"/g, '""');
-      return [v.date, v.time, v.shopName, v.owner, v.phone, v.businessType, v.cabang, v.status, v.isNewCustomer ? 'Ya' : 'Tidak', peg?.name || '-', `"${catatan}"`];
-    });
-    const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
-    const blob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `laporan-canvasing-${selectedCabang}-${new Date().toISOString().split('T')[0]}.csv`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-  };
-
-  return (
-    <div className="p-6 md:p-8 space-y-6 bg-slate-50 min-h-screen">
-      <div className="flex flex-col md:flex-row justify-between md:items-center gap-4 mb-8">
-        <div>
-          <h1 className="text-2xl md:text-3xl font-bold text-slate-800">Dashboard Pusat Canvasing</h1>
-          <p className="text-slate-500">Monitor Aktivitas Kunjungan Es Kristal Garuda</p>
-        </div>
-        <div className="flex flex-col sm:flex-row gap-3">
-          <select
-            value={selectedCabang}
-            onChange={(e) => setSelectedCabang(e.target.value)}
-            className="bg-white border border-slate-200 text-slate-800 rounded-xl px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-sm font-medium"
-          >
-            {cabangList.map(c => <option key={c} value={c}>Cabang: {c}</option>)}
-          </select>
-          <Button variant="outline" className="py-2" onClick={handleExport}><FileText size={16} /> Export Laporan</Button>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
-        <Card className="p-6 border-l-4 border-l-blue-500">
-          <p className="text-slate-500 text-sm font-medium">Total Kunjungan Canvasing</p>
-          <p className="text-3xl font-black text-slate-800 mt-2">{totalVisits}</p>
-        </Card>
-        <Card className="p-6 border-l-4 border-l-emerald-500">
-          <p className="text-slate-500 text-sm font-medium">Akuisisi Toko Baru</p>
-          <p className="text-3xl font-black text-slate-800 mt-2">{newShops}</p>
-        </Card>
-        <Card className="p-6 border-l-4 border-l-yellow-500">
-          <p className="text-slate-500 text-sm font-medium">Dalam Prospek & Follow Up</p>
-          <p className="text-3xl font-black text-slate-800 mt-2">{totalProspek}</p>
-        </Card>
-        <Card className="p-6 border-l-4 border-l-indigo-500">
-          <p className="text-slate-500 text-sm font-medium">Pegawai Lapangan Aktif</p>
-          <p className="text-3xl font-black text-slate-800 mt-2">{activeEmployees}</p>
-        </Card>
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mt-6">
-        <Card className="p-6 lg:col-span-2">
-          <h3 className="font-bold text-slate-800 mb-6 text-lg">Trend Kunjungan & Toko Baru (7 Hari Terakhir)</h3>
-          <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartData}>
-                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-                <XAxis dataKey="name" axisLine={false} tickLine={false} />
-                <YAxis axisLine={false} tickLine={false} allowDecimals={false} />
-                <Tooltip cursor={{ fill: '#f1f5f9' }} />
-                <Legend />
-                <Bar dataKey="kunjungan" fill="#2563eb" radius={[4, 4, 0, 0]} name="Total Kunjungan" />
-                <Bar dataKey="tokoBaru" fill="#10b981" radius={[4, 4, 0, 0]} name="Toko Baru" />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </Card>
-
-        <Card className="p-6">
-          <h3 className="font-bold text-slate-800 mb-6 text-lg flex items-center gap-2">
-            <TrendingUp className="text-blue-500" /> Ranking Kinerja Pegawai
-          </h3>
-          <div className="space-y-4">
-            {ranking.slice(0, 5).map((r, i) => (
-              <div key={i} className="flex items-center justify-between p-3 rounded-xl bg-slate-50 border border-slate-100">
-                <div className="flex items-center gap-3">
-                  <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm ${i === 0 ? 'bg-yellow-100 text-yellow-600' : 'bg-slate-200 text-slate-600'}`}>
-                    #{i + 1}
-                  </div>
-                  <div>
-                    <p className="font-semibold text-slate-800 text-sm">{r.name}</p>
-                    <p className="text-xs text-slate-500">{r.cabang}</p>
-                  </div>
-                </div>
-                <div className="text-right">
-                  <p className="font-bold text-blue-600">{r.visits} Kunjungan</p>
-                  <p className="text-xs text-emerald-600 font-medium">+{r.tokoBaru} Toko Baru</p>
-                </div>
-              </div>
-            ))}
-            {ranking.length === 0 && <p className="text-sm text-slate-400 text-center py-4">Belum ada data pegawai.</p>}
-          </div>
-        </Card>
-      </div>
-    </div>
-  );
-};
-
-const statusColorHex: Record<string, string> = {
-  'Closing': '#10b981',
-  'Prospek': '#2563eb',
-  'Follow Up': '#eab308',
-  'Menolak': '#ef4444',
-};
-const getStatusHex = (status: string) => statusColorHex[status] || '#94a3b8';
-
-const getStatusColorClasses = (status: string) => {
-  switch (status) {
-    case 'Closing': return 'bg-emerald-500 border-emerald-200';
-    case 'Prospek': return 'bg-blue-500 border-blue-200';
-    case 'Follow Up': return 'bg-yellow-500 border-yellow-200';
-    case 'Menolak': return 'bg-red-500 border-red-200';
-    default: return 'bg-slate-400 border-slate-200';
-  }
-};
-
-const AdminMap = ({ visits, users }: { visits: Visit[], users: User[] }) => {
-  const [filterCabang, setFilterCabang] = useState('Semua');
-  const [filterPegawai, setFilterPegawai] = useState('Semua');
-  const [filterStatus, setFilterStatus] = useState('Semua');
-  const [selectedMarker, setSelectedMarker] = useState<Visit | null>(null);
-  const [showPhoto, setShowPhoto] = useState(false);
-
-  const mapDivRef = useRef<HTMLDivElement | null>(null);
-  const mapRef = useRef<L.Map | null>(null);
-  const markersRef = useRef<L.Marker[]>([]);
-
-  const cabangList = ['Semua', ...Array.from(new Set(users.filter(u => u.role === 'pegawai').map(u => u.cabang)))];
-  const pegawaiList = ['Semua', ...users.filter(u => u.role === 'pegawai' && (filterCabang === 'Semua' || u.cabang === filterCabang)).map(u => u.name)];
-  const statusList = ['Semua', 'Prospek', 'Closing', 'Follow Up', 'Menolak', 'Sudah Pakai Es', 'Belum Pakai Es'];
-
-  const filteredVisits = visits.filter(v => {
-    const peg = users.find(u => u.id === v.pegawaiId);
-    if (filterCabang !== 'Semua' && peg?.cabang !== filterCabang) return false;
-    if (filterPegawai !== 'Semua' && peg?.name !== filterPegawai) return false;
-    if (filterStatus !== 'Semua' && v.status !== filterStatus) return false;
-    return v.lat !== null && v.lng !== null;
-  });
-
-  // Inisialisasi peta sekali saat komponen pertama kali muncul
-  useEffect(() => {
-    if (!mapDivRef.current || mapRef.current) return;
-    const map = L.map(mapDivRef.current).setView([-7.15, 107.95], 11);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-      maxZoom: 19,
-    }).addTo(map);
-    mapRef.current = map;
-    return () => {
-      map.remove();
-      mapRef.current = null;
-    };
-  }, []);
-
-  // Update marker setiap kali data/filter berubah
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-
-    markersRef.current.forEach(m => m.remove());
-    markersRef.current = [];
-
-    filteredVisits.forEach(v => {
-      const color = getStatusHex(v.status);
-      const icon = L.divIcon({
-        className: '',
-        html: `<div style="background:${color};width:18px;height:18px;border-radius:50%;border:3px solid white;box-shadow:0 2px 6px rgba(0,0,0,0.4)"></div>`,
-        iconSize: [18, 18],
-        iconAnchor: [9, 9],
-      });
-      const marker = L.marker([v.lat as number, v.lng as number], { icon }).addTo(map);
-      marker.bindTooltip(v.shopName, { direction: 'top', offset: [0, -8] });
-      marker.on('click', () => setSelectedMarker(v));
-      markersRef.current.push(marker);
-    });
-
-    if (filteredVisits.length > 0) {
-      const bounds = L.latLngBounds(filteredVisits.map(v => [v.lat as number, v.lng as number]));
-      map.fitBounds(bounds, { padding: [40, 40], maxZoom: 15 });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visits, filterCabang, filterPegawai, filterStatus]);
-
-  const openInGoogleMaps = (lat: number, lng: number) => {
-    window.open(`https://www.google.com/maps?q=${lat},${lng}`, '_blank', 'noopener,noreferrer');
-  };
-
-  return (
-    <div className="p-6 md:p-8 space-y-6 bg-slate-50 min-h-screen">
-      <div>
-        <h1 className="text-2xl md:text-3xl font-bold text-slate-800">Peta Sebaran Canvasing</h1>
-        <p className="text-slate-500">Tracking GPS real-time dari aktivitas lapangan pegawai.</p>
-      </div>
-
-      <Card className="p-5">
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-          <Select label="Filter Cabang" value={filterCabang} onChange={(e: any) => { setFilterCabang(e.target.value); setFilterPegawai('Semua'); }} options={cabangList} />
-          <Select label="Filter Pegawai" value={filterPegawai} onChange={(e: any) => setFilterPegawai(e.target.value)} options={pegawaiList} />
-          <Select label="Status Kunjungan" value={filterStatus} onChange={(e: any) => setFilterStatus(e.target.value)} options={statusList} />
-          <div className="flex items-end pb-4">
-            <Button variant="outline" className="w-full" onClick={() => { setFilterCabang('Semua'); setFilterPegawai('Semua'); setFilterStatus('Semua'); }}>Reset Filter</Button>
-          </div>
-        </div>
-      </Card>
-
-      <Card className="p-0 overflow-hidden relative h-[600px]">
-        <div ref={mapDivRef} className="w-full h-full z-0" />
-
-        <div className="absolute top-4 left-4 z-[400] bg-white/90 p-4 rounded-xl shadow-md border border-white backdrop-blur text-sm font-medium space-y-2 pointer-events-none">
-          <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-emerald-500"></div> Sukses/Closing</div>
-          <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-blue-500"></div> Prospek Baru</div>
-          <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-yellow-500"></div> Perlu Follow Up</div>
-          <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-red-500"></div> Menolak</div>
-        </div>
-
-        {selectedMarker && (
-          <div className="absolute top-4 right-4 w-80 bg-white rounded-2xl shadow-2xl border border-slate-200 z-[500] p-4 animate-in fade-in slide-in-from-right-8">
-            <div className="flex justify-between items-start mb-4">
-              <div>
-                <h3 className="font-bold text-slate-800 text-lg">{selectedMarker.shopName}</h3>
-                <p className="text-xs text-slate-500 flex items-center gap-1"><MapPin size={12} /> {selectedMarker.cabang} {selectedMarker.area && `(${selectedMarker.area})`}</p>
-              </div>
-              <button onClick={() => setSelectedMarker(null)} className="p-1 bg-slate-100 rounded-full hover:bg-slate-200"><X size={16} /></button>
-            </div>
-
-            <div className="space-y-3 text-sm">
-              <div className="flex justify-between border-b pb-2"><span className="text-slate-500">Pemilik</span> <span className="font-medium text-slate-800">{selectedMarker.owner}</span></div>
-              <div className="flex justify-between border-b pb-2"><span className="text-slate-500">No HP</span> <span className="font-medium text-slate-800">{selectedMarker.phone}</span></div>
-              <div className="flex justify-between border-b pb-2"><span className="text-slate-500">Pegawai (Sales)</span> <span className="font-medium text-blue-600">{users.find(u => u.id === selectedMarker.pegawaiId)?.name}</span></div>
-              <div className="flex justify-between border-b pb-2"><span className="text-slate-500">Toko Baru?</span> <span className="font-medium text-slate-800">{selectedMarker.isNewCustomer ? 'Ya' : 'Tidak'}</span></div>
-              <div className="flex justify-between border-b pb-2"><span className="text-slate-500">Status</span>
-                <span className={`px-2 py-0.5 rounded-full text-xs font-bold text-white ${getStatusColorClasses(selectedMarker.status).split(' ')[0]}`}>{selectedMarker.status}</span>
-              </div>
-              <div className="flex justify-between border-b pb-2"><span className="text-slate-500">Tgl Kunjungan</span> <span className="font-medium text-slate-800">{selectedMarker.date} {selectedMarker.time}</span></div>
-              {selectedMarker.nextFollowUp && (
-                <div className="flex justify-between border-b pb-2"><span className="text-slate-500 font-bold text-yellow-600">Janji Follow Up</span> <span className="font-bold text-slate-800">{selectedMarker.nextFollowUp}</span></div>
-              )}
-              <div>
-                <span className="text-slate-500 block mb-1">Catatan Laporan:</span>
-                <p className="bg-slate-50 p-2 rounded-lg text-slate-700 italic border border-slate-100">{selectedMarker.result}</p>
-              </div>
-              <div className="flex gap-2 mt-4">
-                <Button variant="outline" className="w-1/2 py-2 text-sm" onClick={() => setShowPhoto(true)} disabled={!selectedMarker.photo}>
-                  <ImageIcon size={16} /> Lihat Foto
-                </Button>
-                <Button
-                  variant="primary" className="w-1/2 py-2 text-sm"
-                  onClick={() => selectedMarker.lat !== null && selectedMarker.lng !== null && openInGoogleMaps(selectedMarker.lat, selectedMarker.lng)}
-                >
-                  <ExternalLink size={16} /> Buka Maps
-                </Button>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {showPhoto && selectedMarker && (
-          <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-sm z-[600] flex items-center justify-center p-4" onClick={() => setShowPhoto(false)}>
-            <div className="max-w-lg w-full" onClick={(e) => e.stopPropagation()}>
-              <div className="flex justify-end mb-2">
-                <button onClick={() => setShowPhoto(false)} className="p-2 bg-white rounded-full shadow hover:bg-slate-100"><X size={18} /></button>
-              </div>
-              {selectedMarker.photo ? (
-                <img src={selectedMarker.photo} alt={selectedMarker.shopName} className="w-full rounded-2xl shadow-2xl" />
-              ) : (
-                <div className="bg-white rounded-2xl p-8 text-center text-slate-500">Foto tidak tersedia untuk kunjungan ini.</div>
-              )}
-            </div>
-          </div>
-        )}
-      </Card>
-    </div>
-  );
-};
-
 const AdminAttendance = ({ attendance, users }: { attendance: Attendance[], users: User[] }) => {
   const todayStr = new Date().toISOString().split('T')[0];
   const [filterCabang, setFilterCabang] = useState('Semua');
@@ -1083,20 +816,59 @@ export default function App() {
   const [syncing, setSyncing] = useState(false);
   const [initialized, setInitialized] = useState(false);
   const [attendanceLoading, setAttendanceLoading] = useState(false);
+  const [isOnline, setIsOnline] = useState(true);
+
+  // Pantau status koneksi supaya bisa tampil peringatan "Sedang Offline"
+  // dan otomatis menyegarkan data begitu koneksi kembali (reconnect otomatis).
+  useEffect(() => {
+    setIsOnline(navigator.onLine);
+    const goOnline = () => {
+      setIsOnline(true);
+      db.get('visits').then((v) => setVisits(v.length > 0 ? v : defaultVisits));
+      db.get('attendance').then((a) => setAttendance(a || []));
+    };
+    const goOffline = () => setIsOnline(false);
+    window.addEventListener('online', goOnline);
+    window.addEventListener('offline', goOffline);
+    return () => {
+      window.removeEventListener('online', goOnline);
+      window.removeEventListener('offline', goOffline);
+    };
+  }, []);
 
   useEffect(() => {
-    const initData = async () => {
-      setSyncing(true);
-      const loadedUsers = await db.get('users');
-      const loadedVisits = await db.get('visits');
-      const loadedAttendance = await db.get('attendance');
-      setUsers(loadedUsers.length > 0 ? loadedUsers : defaultUsers);
-      setVisits(loadedVisits.length > 0 ? loadedVisits : defaultVisits);
-      setAttendance(loadedAttendance || []);
-      setSyncing(false);
+    // Ambil data users, visits, dan attendance SEKALIGUS secara paralel
+    // (bukan satu-satu berurutan) supaya total waktu tunggu jauh lebih singkat,
+    // terutama kalau sumber datanya Google Sheets/Apps Script.
+    setSyncing(true);
+    const usersPromise = db.get('users');
+    const visitsPromise = db.get('visits');
+    const attendancePromise = db.get('attendance');
+
+    // Layar login cuma butuh data 'users', jadi begitu itu selesai,
+    // langsung tampilkan layar login tanpa menunggu data kunjungan & absensi.
+    usersPromise.then((loadedUsers) => {
+      const finalUsers = loadedUsers.length > 0 ? loadedUsers : defaultUsers;
+      setUsers(finalUsers);
       setInitialized(true);
-    };
-    initData();
+
+      // Auto-login: kalau ada sesi tersimpan dari login sebelumnya dan
+      // akunnya masih aktif, langsung masuk tanpa perlu login ulang.
+      const savedSessionId = localStorage.getItem('esgaruda_session');
+      if (savedSessionId) {
+        const savedUser = finalUsers.find((u: User) => u.id === savedSessionId && u.status !== 'Nonaktif');
+        if (savedUser) setUser(savedUser);
+        else localStorage.removeItem('esgaruda_session');
+      }
+    });
+    visitsPromise.then((loadedVisits) => {
+      setVisits(loadedVisits.length > 0 ? loadedVisits : defaultVisits);
+    });
+    attendancePromise.then((loadedAttendance) => {
+      setAttendance(loadedAttendance || []);
+    });
+
+    Promise.allSettled([usersPromise, visitsPromise, attendancePromise]).then(() => setSyncing(false));
   }, []);
 
   const syncToDB = async (collection: string, data: any) => {
@@ -1118,11 +890,23 @@ export default function App() {
 
   const handleLogin = (loggedInUser: User) => {
     setUser(loggedInUser);
+    localStorage.setItem('esgaruda_session', loggedInUser.id);
     const updatedUsers = users.map(u => u.id === loggedInUser.id ? { ...u, lastLogin: new Date().toLocaleString('id-ID') } : u);
     handleUsersUpdate(updatedUsers);
   };
 
-  const handleLogout = () => { setUser(null); setCurrentTab('home'); setAdminTab('dashboard'); };
+  const handleLogout = () => {
+    setUser(null);
+    setCurrentTab('home');
+    setAdminTab('dashboard');
+    localStorage.removeItem('esgaruda_session');
+  };
+
+  const confirmLogout = () => {
+    if (window.confirm('Yakin ingin logout dari aplikasi?')) {
+      handleLogout();
+    }
+  };
 
   const handleAddVisit = (newVisit: Visit) => {
     const updatedVisits = [newVisit, ...visits];
@@ -1196,7 +980,7 @@ export default function App() {
               <div className="w-8 h-8 bg-white rounded-lg flex items-center justify-center text-blue-700"><LogoIcon size={20} /></div>
               <span className="font-bold text-lg hidden md:block">Pusat Canvasing</span>
             </div>
-            <button onClick={handleLogout} className="md:hidden p-2 text-blue-200 hover:text-white"><LogOut size={20} /></button>
+            <button onClick={confirmLogout} className="md:hidden p-2 text-red-200 hover:text-white"><LogOut size={20} /></button>
           </div>
           <nav className="p-4 flex-1 hidden md:flex flex-col gap-2">
             <button onClick={() => setAdminTab('dashboard')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'dashboard' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><BarChart3 size={20} /> Dashboard Kunjungan</button>
@@ -1206,6 +990,7 @@ export default function App() {
           </nav>
           <div className="p-4 hidden md:block border-t border-blue-600">
             {syncing && <div className="text-xs text-blue-200 mb-2 flex items-center gap-1 justify-center"><RefreshCw size={12} className="animate-spin" /> Sinkronisasi Database...</div>}
+            {!isOnline && <div className="text-xs text-yellow-200 mb-2 flex items-center gap-1 justify-center"><WifiOff size={12} /> Sedang Offline</div>}
             <div className="flex items-center gap-3 mb-4">
               <div className="w-10 h-10 rounded-full bg-blue-500 flex items-center justify-center font-bold">{user.name.charAt(0)}</div>
               <div>
@@ -1213,16 +998,38 @@ export default function App() {
                 <p className="text-xs text-blue-300 capitalize">{user.role}</p>
               </div>
             </div>
-            <Button variant="danger" onClick={handleLogout} className="w-full py-2 bg-blue-800 hover:bg-blue-900 text-white shadow-none border border-blue-600"><LogOut size={16} /> Logout</Button>
+            <Button variant="danger" onClick={confirmLogout} className="w-full py-2 bg-red-600 hover:bg-red-700 text-white shadow-none border border-red-500"><LogOut size={16} /> Logout</Button>
           </div>
         </aside>
 
-        <main className="flex-1 overflow-y-auto">
-          {adminTab === 'dashboard' && <AdminDashboard visits={visits} users={users} />}
-          {adminTab === 'map' && <AdminMap visits={visits} users={users} />}
+        <main className="flex-1 overflow-y-auto pb-20 md:pb-0">
+          <Suspense fallback={<AdminSectionLoading />}>
+            {adminTab === 'dashboard' && <AdminDashboard visits={visits} users={users} />}
+            {adminTab === 'map' && <AdminMap visits={visits} users={users} />}
+          </Suspense>
           {adminTab === 'attendance' && <AdminAttendance attendance={attendance} users={users} />}
           {adminTab === 'employees' && <AdminEmployees users={users} setUsers={handleUsersUpdate} addAuditLog={addAuditLog} />}
         </main>
+
+        {/* Menu mobile - sebelumnya menu ini tidak ada sama sekali di layar kecil/PWA */}
+        <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 flex justify-around p-2 pb-safe z-20">
+          <button onClick={() => setAdminTab('dashboard')} className={`flex flex-col items-center gap-1 p-2 flex-1 transition-colors ${adminTab === 'dashboard' ? 'text-blue-600' : 'text-slate-400'}`}>
+            <BarChart3 size={22} />
+            <span className="text-[10px] font-medium">Dashboard</span>
+          </button>
+          <button onClick={() => setAdminTab('map')} className={`flex flex-col items-center gap-1 p-2 flex-1 transition-colors ${adminTab === 'map' ? 'text-blue-600' : 'text-slate-400'}`}>
+            <Map size={22} />
+            <span className="text-[10px] font-medium">Peta</span>
+          </button>
+          <button onClick={() => setAdminTab('attendance')} className={`flex flex-col items-center gap-1 p-2 flex-1 transition-colors ${adminTab === 'attendance' ? 'text-blue-600' : 'text-slate-400'}`}>
+            <Clock size={22} />
+            <span className="text-[10px] font-medium">Absensi</span>
+          </button>
+          <button onClick={() => setAdminTab('employees')} className={`flex flex-col items-center gap-1 p-2 flex-1 transition-colors ${adminTab === 'employees' ? 'text-blue-600' : 'text-slate-400'}`}>
+            <Users size={22} />
+            <span className="text-[10px] font-medium">Pegawai</span>
+          </button>
+        </nav>
       </div>
     );
   }
@@ -1239,7 +1046,8 @@ export default function App() {
           </div>
           <div className="flex items-center gap-3">
             {syncing && <RefreshCw size={16} className="text-slate-400 animate-spin" />}
-            <button onClick={handleLogout} className="p-2 text-slate-400 hover:text-red-500 transition-colors rounded-full hover:bg-red-50">
+            {!isOnline && <WifiOff size={16} className="text-yellow-500" />}
+            <button onClick={confirmLogout} className="p-2 text-red-500 hover:text-red-600 hover:bg-red-50 transition-colors rounded-full">
               <LogOut size={20} />
             </button>
           </div>
