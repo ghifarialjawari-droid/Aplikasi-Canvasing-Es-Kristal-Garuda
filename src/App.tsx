@@ -21,7 +21,7 @@ const AdminReports = lazy(() => import('./admin/AdminReports'));
 // ==========================================
 // Ganti string kosong di bawah dengan URL Web App Google Apps Script Anda saat siap integrasi.
 // Selama kosong, aplikasi berjalan di mode Sandbox (menggunakan LocalStorage)
-const GAS_API_URL = "https://script.google.com/macros/s/AKfycbw1WM795b0RuqMkb81m4GxBYsImwrfn9zwJYCq_scJp7e1rhIoZTZAkybXSwWiz9W7a/exec";
+const GAS_API_URL = "";
 
 // Kunci sederhana supaya endpoint Google Apps Script tidak bisa diakses
 // sembarang orang yang kebetulan menemukan URL-nya. Ganti ke teks bebas
@@ -108,6 +108,18 @@ function timeToMinutes(t: string): number {
   return (h || 0) * 60 + (m || 0);
 }
 
+// Target Kunjungan yang berlaku untuk seorang pegawai bulan ini: utamakan
+// entri "Target Canvasing" (scope pegawai, periode bulanan, bulan berjalan)
+// kalau ada; kalau belum ada, pakai target bawaan akun (User.target) sebagai
+// cadangan. Ini menyatukan dua sistem target supaya selalu konsisten di
+// mana pun ditampilkan (Kelola Pegawai, Dashboard Pegawai, dsb).
+function getEffectiveTarget(u: User, targets: Target[]): { visits: number, newCustomers: number } {
+  const thisMonthStr = new Date().toISOString().slice(0, 7);
+  const match = targets.find(t => t.period === 'bulanan' && t.scope === 'pegawai' && t.scopeId === u.id && t.startDate.slice(0, 7) === thisMonthStr);
+  if (match) return { visits: match.visitTarget, newCustomers: match.newCustomerTarget };
+  return { visits: u.target?.visits || 0, newCustomers: u.target?.newCustomers || 0 };
+}
+
 // Target Canvasing - dibuat Admin, bisa untuk 1 pegawai atau seluruh cabang/depot
 interface Target {
   id: string;
@@ -180,22 +192,30 @@ const db = {
       return [];
     }
   },
-  async save(collection: string, data: any) {
+  async save(collection: string, data: any): Promise<{ ok: boolean, error?: string }> {
     // Simpan salinan cadangan di HP ini juga, supaya data tidak hilang
     // kalau koneksi ke server terputus saat menyimpan.
     localStorage.setItem(`esgaruda_cache_${collection}`, JSON.stringify(data));
 
     if (GAS_API_URL) {
       try {
-        await fetchWithRetry(GAS_API_URL, {
+        const res = await fetchWithRetry(GAS_API_URL, {
           method: 'POST',
           body: JSON.stringify({ action: 'save', collection, data, key: GAS_API_KEY }),
         });
+        const json = await res.json().catch(() => null);
+        if (json && json.error) {
+          console.error(`API Error (save "${collection}"):`, json.error);
+          return { ok: false, error: json.error };
+        }
+        return { ok: true };
       } catch (err) {
-        console.error('API Error (save):', err);
+        console.error(`API Error (save "${collection}"):`, err);
+        return { ok: false, error: String(err) };
       }
     } else {
       localStorage.setItem(`esgaruda_${collection}`, JSON.stringify(data));
+      return { ok: true };
     }
   }
 };
@@ -837,7 +857,7 @@ const AdminAttendance = ({
   );
 };
 
-const AdminEmployees = ({ users, setUsers, addAuditLog }: { users: User[], setUsers: any, addAuditLog: any }) => {
+const AdminEmployees = ({ users, setUsers, addAuditLog, targets, onUpdateTargets }: { users: User[], setUsers: any, addAuditLog: any, targets: Target[], onUpdateTargets: (t: Target[]) => void }) => {
   const [showModal, setShowModal] = useState<'add' | 'edit' | 'reset' | null>(null);
   const [selectedUser, setSelectedUser] = useState<User | null>(null);
   const [formData, setFormData] = useState<any>({});
@@ -850,7 +870,8 @@ const AdminEmployees = ({ users, setUsers, addAuditLog }: { users: User[], setUs
     if (type === 'add') {
       setFormData({ id: '', name: '', password: '', confirm: '', cabang: '', area: '', role: 'pegawai', status: 'Aktif' });
     } else if (type === 'edit' && user) {
-      setFormData({ ...user });
+      const effective = getEffectiveTarget(user, targets);
+      setFormData({ ...user, visitTarget: effective.visits, newCustomerTarget: effective.newCustomers });
     } else if (type === 'reset') {
       setFormData({ password: '', confirm: '' });
     }
@@ -881,8 +902,33 @@ const AdminEmployees = ({ users, setUsers, addAuditLog }: { users: User[], setUs
       if (!cleanId || !cleanName) return alert("ID Login dan Nama wajib diisi.");
       if (cleanId !== selectedUser.id.toUpperCase() && users.find(u => u.id.toUpperCase() === cleanId)) return alert("ID Login sudah digunakan user lain!");
 
-      setUsers(users.map(u => u.id === selectedUser.id ? { ...u, ...formData, id: cleanId, name: cleanName } : u));
-      addAuditLog('Edit Akun', `Mengubah profil/cabang pegawai: ${cleanName}`);
+      const visitTarget = Math.max(0, Number(formData.visitTarget) || 0);
+      const newCustomerTarget = Math.max(0, Number(formData.newCustomerTarget) || 0);
+
+      setUsers(users.map(u => u.id === selectedUser.id
+        ? { ...u, ...formData, id: cleanId, name: cleanName, target: { visits: visitTarget, newCustomers: newCustomerTarget } }
+        : u));
+
+      // Samakan dengan Target Canvasing bulan ini: perbarui kalau sudah ada, buat baru kalau belum.
+      const thisMonthStr = new Date().toISOString().slice(0, 7);
+      const existingTarget = targets.find(t => t.period === 'bulanan' && t.scope === 'pegawai' && t.scopeId === selectedUser.id && t.startDate.slice(0, 7) === thisMonthStr);
+      if (existingTarget) {
+        onUpdateTargets(targets.map(t => t.id === existingTarget.id ? { ...t, visitTarget, newCustomerTarget, scopeLabel: cleanName } : t));
+      } else {
+        const newTarget: Target = {
+          id: Date.now().toString(),
+          scope: 'pegawai',
+          scopeId: cleanId,
+          scopeLabel: cleanName,
+          period: 'bulanan',
+          startDate: new Date().toISOString().split('T')[0],
+          visitTarget,
+          newCustomerTarget,
+        };
+        onUpdateTargets([newTarget, ...targets]);
+      }
+
+      addAuditLog('Edit Akun', `Mengubah profil/target pegawai: ${cleanName}`);
     } else if (showModal === 'reset' && selectedUser) {
       if (formData.password.length < 8) return alert("Password minimal 8 karakter.");
       if (formData.password !== formData.confirm) return alert("Password tidak cocok!");
@@ -938,7 +984,7 @@ const AdminEmployees = ({ users, setUsers, addAuditLog }: { users: User[], setUs
                     <p className="text-xs text-slate-500 uppercase">{u.role}</p>
                   </td>
                   <td className="p-4 text-slate-600">{u.cabang} {u.area && `(${u.area})`}</td>
-                  <td className="p-4 text-slate-600 font-medium">{u.target?.visits || 0} Toko/Bulan</td>
+                  <td className="p-4 text-slate-600 font-medium">{getEffectiveTarget(u, targets).visits} Toko/Bulan</td>
                   <td className="p-4">
                     <span className={`px-3 py-1 rounded-full text-xs font-bold ${u.status === 'Aktif' ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
                       {u.status}
@@ -981,6 +1027,16 @@ const AdminEmployees = ({ users, setUsers, addAuditLog }: { users: User[], setUs
                     <Select label="Role/Jabatan" value={formData.role} onChange={(e: any) => setFormData({ ...formData, role: e.target.value })} options={roles} required />
                   </div>
                   <Input label="Area Operasional" value={formData.area || ''} onChange={(e: any) => setFormData({ ...formData, area: e.target.value })} placeholder="Opsional (Cth: Cibiuk)" />
+
+                  {showModal === 'edit' && formData.role === 'pegawai' && (
+                    <div className="bg-emerald-50 p-4 rounded-xl border border-emerald-100 space-y-4">
+                      <h3 className="font-semibold text-emerald-800 text-sm flex items-center gap-2"><TargetIcon size={16} /> Target Bulan Ini (tersinkron dengan Target Canvasing)</h3>
+                      <div className="grid grid-cols-2 gap-4">
+                        <Input label="Target Kunjungan" type="number" value={formData.visitTarget} onChange={(e: any) => setFormData({ ...formData, visitTarget: Math.max(0, Number(e.target.value)) })} />
+                        <Input label="Target Toko Baru" type="number" value={formData.newCustomerTarget} onChange={(e: any) => setFormData({ ...formData, newCustomerTarget: Math.max(0, Number(e.target.value)) })} />
+                      </div>
+                    </div>
+                  )}
                 </>
               )}
 
@@ -1018,6 +1074,7 @@ export default function App() {
   const [initialized, setInitialized] = useState(false);
   const [attendanceLoading, setAttendanceLoading] = useState(false);
   const [isOnline, setIsOnline] = useState(true);
+  const [syncError, setSyncError] = useState<string | null>(null);
 
   // Pantau status koneksi supaya bisa tampil peringatan "Sedang Offline"
   // dan otomatis menyegarkan data begitu koneksi kembali (reconnect otomatis).
@@ -1089,8 +1146,12 @@ export default function App() {
 
   const syncToDB = async (collection: string, data: any) => {
     setSyncing(true);
-    await db.save(collection, data);
+    const result = await db.save(collection, data);
     setSyncing(false);
+    if (!result.ok) {
+      setSyncError(`Gagal menyimpan "${collection}" ke server. Data tersimpan sementara di HP ini, coba sinkron ulang nanti.`);
+      setTimeout(() => setSyncError(null), 7000);
+    }
   };
 
   const handleUsersUpdate = (newUsers: User[]) => {
@@ -1276,6 +1337,11 @@ export default function App() {
   if (user.role === 'admin' || user.role === 'owner') {
     return (
       <div className="min-h-screen bg-slate-50 flex flex-col md:flex-row">
+        {syncError && (
+          <div className="fixed bottom-20 md:bottom-4 left-1/2 -translate-x-1/2 z-[999] bg-red-600 text-white text-xs font-medium px-4 py-2 rounded-full shadow-lg max-w-[90%] text-center">
+            {syncError}
+          </div>
+        )}
         <aside className="bg-blue-700 text-white w-full md:w-64 flex-shrink-0 flex flex-col">
           <div className="p-6 flex items-center justify-between md:justify-center border-b border-blue-600">
             <div className="flex items-center gap-2">
@@ -1314,7 +1380,7 @@ export default function App() {
             {adminTab === 'reports' && <AdminReports visits={visits} users={users} />}
           </Suspense>
           {adminTab === 'attendance' && <AdminAttendance attendance={attendance} users={users} attendanceSettings={attendanceSettings} onUpdateSettings={handleUpdateAttendanceSettings} />}
-          {adminTab === 'employees' && <AdminEmployees users={users} setUsers={handleUsersUpdate} addAuditLog={addAuditLog} />}
+          {adminTab === 'employees' && <AdminEmployees users={users} setUsers={handleUsersUpdate} addAuditLog={addAuditLog} targets={targets} onUpdateTargets={handleUpdateTargets} />}
         </main>
 
         {/* Menu mobile - sebelumnya menu ini tidak ada sama sekali di layar kecil/PWA */}
@@ -1352,6 +1418,11 @@ export default function App() {
   return (
     <div className="min-h-screen bg-slate-50 flex justify-center">
       <div className="w-full max-w-md bg-slate-50 relative min-h-screen flex flex-col shadow-2xl">
+        {syncError && (
+          <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[999] bg-red-600 text-white text-xs font-medium px-4 py-2 rounded-full shadow-lg max-w-[90%] text-center">
+            {syncError}
+          </div>
+        )}
 
         <header className="bg-white px-4 py-3 flex items-center justify-between shadow-sm z-10 sticky top-0">
           <div className="flex items-center gap-2">
