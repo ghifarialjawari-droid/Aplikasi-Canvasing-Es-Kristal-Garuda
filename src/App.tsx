@@ -21,7 +21,7 @@ const AdminReports = lazy(() => import('./admin/AdminReports'));
 // ==========================================
 // Ganti string kosong di bawah dengan URL Web App Google Apps Script Anda saat siap integrasi.
 // Selama kosong, aplikasi berjalan di mode Sandbox (menggunakan LocalStorage)
-const GAS_API_URL = "https://script.google.com/macros/s/AKfycbw1WM795b0RuqMkb81m4GxBYsImwrfn9zwJYCq_scJp7e1rhIoZTZAkybXSwWiz9W7a/exec";
+const GAS_API_URL = "";
 
 // Kunci sederhana supaya endpoint Google Apps Script tidak bisa diakses
 // sembarang orang yang kebetulan menemukan URL-nya. Ganti ke teks bebas
@@ -322,20 +322,33 @@ const LoginScreen = ({ onLogin, users }: { onLogin: (u: User) => void, users: Us
 };
 
 const PegawaiDashboard = ({
-  user, visits, attendanceToday, onCheckIn, onCheckOut, attendanceLoading, attendanceSettings
+  user, visits, attendanceToday, onCheckIn, onCheckOut, attendanceLoading, attendanceSettings, targets
 }: {
   user: User, visits: Visit[], attendanceToday: Attendance | null,
-  onCheckIn: () => void, onCheckOut: () => void, attendanceLoading: boolean, attendanceSettings: AttendanceSettings
+  onCheckIn: () => void, onCheckOut: () => void, attendanceLoading: boolean, attendanceSettings: AttendanceSettings, targets: Target[]
 }) => {
   const myVisits = visits.filter(v => v.pegawaiId === user.id);
   const todayDate = new Date().toISOString().split('T')[0];
+  const thisMonthStr = todayDate.slice(0, 7);
   const visitsToday = myVisits.filter(v => v.date === todayDate).length;
   const newCustomers = myVisits.filter(v => v.isNewCustomer).length;
-  const targetVisits = user.target.visits || 1;
-  const targetNew = user.target.newCustomers || 1;
 
-  const progressVisits = Math.min(100, Math.round((myVisits.length / targetVisits) * 100));
-  const progressNew = Math.min(100, Math.round((newCustomers / targetNew) * 100));
+  // Realisasi bulan ini (sebelumnya salah hitung semua kunjungan sepanjang waktu)
+  const monthlyVisits = myVisits.filter(v => v.date.slice(0, 7) === thisMonthStr);
+  const realisasiVisits = monthlyVisits.length;
+  const realisasiNew = monthlyVisits.filter(v => v.isNewCustomer).length;
+
+  // Utamakan target dari menu "Target Canvasing" (Admin) kalau ada yang berlaku
+  // bulan ini untuk pegawai ini atau cabangnya; kalau tidak ada, pakai target
+  // bawaan akun (User.target) sebagai cadangan.
+  const myTarget = targets.find(t => t.period === 'bulanan' && t.scope === 'pegawai' && t.scopeId === user.id && t.startDate.slice(0, 7) === thisMonthStr)
+    || targets.find(t => t.period === 'bulanan' && t.scope === 'cabang' && t.scopeId === user.cabang && t.startDate.slice(0, 7) === thisMonthStr);
+
+  const targetVisits = myTarget ? myTarget.visitTarget : (user.target.visits || 0);
+  const targetNew = myTarget ? myTarget.newCustomerTarget : (user.target.newCustomers || 0);
+
+  const progressVisits = targetVisits > 0 ? Math.min(100, Math.round((realisasiVisits / targetVisits) * 100)) : 0;
+  const progressNew = targetNew > 0 ? Math.min(100, Math.round((realisasiNew / targetNew) * 100)) : 0;
 
   // Hitung status jadwal absen saat ini supaya pegawai lihat info-nya
   // tanpa harus klik tombol dulu.
@@ -375,7 +388,7 @@ const PegawaiDashboard = ({
         <div className="mt-4 bg-white/10 p-4 rounded-2xl backdrop-blur-sm border border-white/20">
           <div className="flex justify-between text-sm mb-2">
             <span>Target Kunjungan (Bulan Ini)</span>
-            <span className="font-bold">{myVisits.length} / {targetVisits}</span>
+            <span className="font-bold">{realisasiVisits} / {targetVisits}</span>
           </div>
           <div className="h-2 bg-black/20 rounded-full overflow-hidden mb-4">
             <div className="h-full bg-emerald-400 rounded-full transition-all duration-1000" style={{ width: `${progressVisits}%` }}></div>
@@ -383,7 +396,7 @@ const PegawaiDashboard = ({
 
           <div className="flex justify-between text-sm mb-2">
             <span>Target Toko Baru</span>
-            <span className="font-bold">{newCustomers} / {targetNew}</span>
+            <span className="font-bold">{realisasiNew} / {targetNew}</span>
           </div>
           <div className="h-2 bg-black/20 rounded-full overflow-hidden">
             <div className="h-full bg-yellow-400 rounded-full transition-all duration-1000" style={{ width: `${progressNew}%` }}></div>
@@ -1363,6 +1376,7 @@ export default function App() {
               onCheckOut={handleCheckOut}
               attendanceLoading={attendanceLoading}
               attendanceSettings={attendanceSettings}
+              targets={targets}
             />
           )}
           {currentTab === 'canvassing' && <CanvassingForm user={user} onSubmit={handleAddVisit} />}
