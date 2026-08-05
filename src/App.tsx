@@ -14,13 +14,20 @@ import {
 const AdminDashboard = lazy(() => import('./admin/AdminDashboard'));
 const AdminMap = lazy(() => import('./admin/AdminMap'));
 const AdminTargets = lazy(() => import('./admin/AdminTargets'));
+const AdminReports = lazy(() => import('./admin/AdminReports'));
 
 // ==========================================
 // KONFIGURASI API GOOGLE APPS SCRIPT
 // ==========================================
 // Ganti string kosong di bawah dengan URL Web App Google Apps Script Anda saat siap integrasi.
 // Selama kosong, aplikasi berjalan di mode Sandbox (menggunakan LocalStorage)
-const GAS_API_URL = "https://script.google.com/macros/s/AKfycbw1WM795b0RuqMkb81m4GxBYsImwrfn9zwJYCq_scJp7e1rhIoZTZAkybXSwWiz9W7a/exec";
+const GAS_API_URL = "";
+
+// Kunci sederhana supaya endpoint Google Apps Script tidak bisa diakses
+// sembarang orang yang kebetulan menemukan URL-nya. Ganti ke teks bebas
+// milikmu sendiri, lalu gunakan teks yang SAMA PERSIS di variabel
+// API_KEY pada Code.gs.
+const GAS_API_KEY = "";
 
 type Role = 'admin' | 'pegawai' | 'owner';
 
@@ -92,6 +99,10 @@ const defaultAttendanceSettings: AttendanceSettings = {
 
 const DAY_NAMES_ID = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
 
+// Sesi login otomatis kedaluwarsa setelah durasi ini (jam) demi keamanan -
+// setelah itu pegawai/admin harus login ulang meskipun tidak logout manual.
+const SESSION_TIMEOUT_HOURS = 12;
+
 function timeToMinutes(t: string): number {
   const [h, m] = t.split(':').map(Number);
   return (h || 0) * 60 + (m || 0);
@@ -149,8 +160,10 @@ const db = {
   async get(collection: string) {
     if (GAS_API_URL) {
       try {
-        const res = await fetchWithRetry(`${GAS_API_URL}?action=get&collection=${collection}`);
-        return await res.json();
+        const res = await fetchWithRetry(`${GAS_API_URL}?action=get&collection=${collection}&key=${encodeURIComponent(GAS_API_KEY)}`);
+        const json = await res.json();
+        if (json && json.error) { console.error('API Error (get):', json.error); return []; }
+        return json;
       } catch (err) {
         console.error('API Error (get):', err);
         // Kalau gagal total (offline/timeout setelah beberapa kali coba),
@@ -176,7 +189,7 @@ const db = {
       try {
         await fetchWithRetry(GAS_API_URL, {
           method: 'POST',
-          body: JSON.stringify({ action: 'save', collection, data }),
+          body: JSON.stringify({ action: 'save', collection, data, key: GAS_API_KEY }),
         });
       } catch (err) {
         console.error('API Error (save):', err);
@@ -493,12 +506,20 @@ const CanvassingForm = ({ user, onSubmit }: { user: User, onSubmit: (v: any) => 
       alert("Foto depan toko WAJIB diambil sebelum submit form!");
       return;
     }
+    if (!formData.shopName.trim()) {
+      alert("Nama toko wajib diisi.");
+      return;
+    }
     setSubmitting(true);
     const newVisit: Visit = {
       id: Date.now().toString(),
       date: new Date().toISOString().split('T')[0],
       time: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
       ...formData,
+      shopName: formData.shopName.trim(),
+      owner: formData.owner.trim(),
+      phone: formData.phone.trim(),
+      result: formData.result.trim(),
       isNewCustomer,
       lat: location.lat,
       lng: location.lng,
@@ -825,23 +846,32 @@ const AdminEmployees = ({ users, setUsers, addAuditLog }: { users: User[], setUs
 
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
+    const cleanId = (formData.id || '').trim().toUpperCase();
+    const cleanName = (formData.name || '').trim();
+
     if (showModal === 'add') {
-      if (users.find(u => u.id === formData.id)) return alert("ID Login sudah digunakan!");
+      if (!cleanId || !cleanName) return alert("ID Login dan Nama wajib diisi.");
+      if (users.find(u => u.id.toUpperCase() === cleanId)) return alert("ID Login sudah digunakan!");
+      if (formData.password.length < 8) return alert("Password minimal 8 karakter.");
       if (formData.password !== formData.confirm) return alert("Password tidak cocok!");
 
       const newUser: User = {
         ...formData,
+        id: cleanId,
+        name: cleanName,
         target: { visits: 100, newCustomers: 20 },
         lastLogin: '-'
       };
       setUsers([...users, newUser]);
       addAuditLog('Tambah Akun', `Menambahkan pegawai baru: ${newUser.name} (${newUser.id})`);
     } else if (showModal === 'edit' && selectedUser) {
-      if (formData.id !== selectedUser.id && users.find(u => u.id === formData.id)) return alert("ID Login sudah digunakan user lain!");
+      if (!cleanId || !cleanName) return alert("ID Login dan Nama wajib diisi.");
+      if (cleanId !== selectedUser.id.toUpperCase() && users.find(u => u.id.toUpperCase() === cleanId)) return alert("ID Login sudah digunakan user lain!");
 
-      setUsers(users.map(u => u.id === selectedUser.id ? { ...u, ...formData } : u));
-      addAuditLog('Edit Akun', `Mengubah profil/cabang pegawai: ${formData.name}`);
+      setUsers(users.map(u => u.id === selectedUser.id ? { ...u, ...formData, id: cleanId, name: cleanName } : u));
+      addAuditLog('Edit Akun', `Mengubah profil/cabang pegawai: ${cleanName}`);
     } else if (showModal === 'reset' && selectedUser) {
+      if (formData.password.length < 8) return alert("Password minimal 8 karakter.");
       if (formData.password !== formData.confirm) return alert("Password tidak cocok!");
 
       setUsers(users.map(u => u.id === selectedUser.id ? { ...u, password: formData.password } : u));
@@ -969,7 +999,7 @@ export default function App() {
   const [targets, setTargets] = useState<Target[]>([]);
   const [attendanceSettings, setAttendanceSettings] = useState<AttendanceSettings>(defaultAttendanceSettings);
   const [currentTab, setCurrentTab] = useState<'home' | 'canvassing' | 'history'>('home');
-  const [adminTab, setAdminTab] = useState<'dashboard' | 'map' | 'employees' | 'attendance' | 'targets'>('dashboard');
+  const [adminTab, setAdminTab] = useState<'dashboard' | 'map' | 'employees' | 'attendance' | 'targets' | 'reports'>('dashboard');
   const [auditLogs, setAuditLogs] = useState<any[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [initialized, setInitialized] = useState(false);
@@ -1012,13 +1042,20 @@ export default function App() {
       setUsers(finalUsers);
       setInitialized(true);
 
-      // Auto-login: kalau ada sesi tersimpan dari login sebelumnya dan
-      // akunnya masih aktif, langsung masuk tanpa perlu login ulang.
-      const savedSessionId = localStorage.getItem('esgaruda_session');
-      if (savedSessionId) {
-        const savedUser = finalUsers.find((u: User) => u.id === savedSessionId && u.status !== 'Nonaktif');
-        if (savedUser) setUser(savedUser);
-        else localStorage.removeItem('esgaruda_session');
+      // Auto-login: kalau ada sesi tersimpan dari login sebelumnya, akunnya
+      // masih aktif, DAN sesinya belum kedaluwarsa, langsung masuk tanpa
+      // perlu login ulang. Sesi kedaluwarsa demi keamanan (mis. HP hilang/dipinjam).
+      try {
+        const savedSessionRaw = localStorage.getItem('esgaruda_session');
+        if (savedSessionRaw) {
+          const savedSession = JSON.parse(savedSessionRaw);
+          const isExpired = Date.now() - savedSession.loginAt > SESSION_TIMEOUT_HOURS * 60 * 60 * 1000;
+          const savedUser = finalUsers.find((u: User) => u.id === savedSession.id && u.status !== 'Nonaktif');
+          if (savedUser && !isExpired) setUser(savedUser);
+          else localStorage.removeItem('esgaruda_session');
+        }
+      } catch {
+        localStorage.removeItem('esgaruda_session');
       }
     });
     visitsPromise.then((loadedVisits) => {
@@ -1066,7 +1103,7 @@ export default function App() {
 
   const handleLogin = (loggedInUser: User) => {
     setUser(loggedInUser);
-    localStorage.setItem('esgaruda_session', loggedInUser.id);
+    localStorage.setItem('esgaruda_session', JSON.stringify({ id: loggedInUser.id, loginAt: Date.now() }));
     const updatedUsers = users.map(u => u.id === loggedInUser.id ? { ...u, lastLogin: new Date().toLocaleString('id-ID') } : u);
     handleUsersUpdate(updatedUsers);
   };
@@ -1083,6 +1120,40 @@ export default function App() {
       handleLogout();
     }
   };
+
+  // Kalau Admin menonaktifkan akun ini dari perangkat lain, paksa logout
+  // begitu data pegawai tersinkron ulang - jangan biarkan sesi lama tetap jalan.
+  useEffect(() => {
+    if (user) {
+      const stillActive = users.find(u => u.id === user.id);
+      if (stillActive && stillActive.status === 'Nonaktif') {
+        alert('Akun Anda telah dinonaktifkan oleh Admin. Anda akan keluar dari aplikasi.');
+        handleLogout();
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [users]);
+
+  // Cek berkala kalau-kalau sesi sudah kedaluwarsa saat aplikasi tetap terbuka lama
+  useEffect(() => {
+    const interval = setInterval(() => {
+      try {
+        const savedSessionRaw = localStorage.getItem('esgaruda_session');
+        if (user && savedSessionRaw) {
+          const savedSession = JSON.parse(savedSessionRaw);
+          const isExpired = Date.now() - savedSession.loginAt > SESSION_TIMEOUT_HOURS * 60 * 60 * 1000;
+          if (isExpired) {
+            alert('Sesi Anda telah berakhir. Silakan login kembali.');
+            handleLogout();
+          }
+        }
+      } catch {
+        // abaikan
+      }
+    }, 5 * 60 * 1000); // cek tiap 5 menit
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]);
 
   const handleAddVisit = (newVisit: Visit) => {
     const updatedVisits = [newVisit, ...visits];
@@ -1205,6 +1276,7 @@ export default function App() {
             <button onClick={() => setAdminTab('map')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'map' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><Map size={20} /> Peta Wilayah GPS</button>
             <button onClick={() => setAdminTab('attendance')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'attendance' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><Clock size={20} /> Absensi Karyawan</button>
             <button onClick={() => setAdminTab('targets')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'targets' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><TargetIcon size={20} /> Target Canvasing</button>
+            <button onClick={() => setAdminTab('reports')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'reports' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><FileText size={20} /> Laporan Bulanan</button>
             <button onClick={() => setAdminTab('employees')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'employees' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><Users size={20} /> Kelola Akun Pegawai</button>
           </nav>
           <div className="p-4 hidden md:block border-t border-blue-600">
@@ -1223,35 +1295,40 @@ export default function App() {
 
         <main className="flex-1 overflow-y-auto pb-20 md:pb-0">
           <Suspense fallback={<AdminSectionLoading />}>
-            {adminTab === 'dashboard' && <AdminDashboard visits={visits} users={users} />}
+            {adminTab === 'dashboard' && <AdminDashboard visits={visits} users={users} attendance={attendance} targets={targets} />}
             {adminTab === 'map' && <AdminMap visits={visits} users={users} />}
             {adminTab === 'targets' && <AdminTargets visits={visits} users={users} targets={targets} onUpdateTargets={handleUpdateTargets} />}
+            {adminTab === 'reports' && <AdminReports visits={visits} users={users} />}
           </Suspense>
           {adminTab === 'attendance' && <AdminAttendance attendance={attendance} users={users} attendanceSettings={attendanceSettings} onUpdateSettings={handleUpdateAttendanceSettings} />}
           {adminTab === 'employees' && <AdminEmployees users={users} setUsers={handleUsersUpdate} addAuditLog={addAuditLog} />}
         </main>
 
         {/* Menu mobile - sebelumnya menu ini tidak ada sama sekali di layar kecil/PWA */}
-        <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 flex justify-around p-2 pb-safe z-20">
-          <button onClick={() => setAdminTab('dashboard')} className={`flex flex-col items-center gap-1 p-2 flex-1 transition-colors ${adminTab === 'dashboard' ? 'text-blue-600' : 'text-slate-400'}`}>
-            <BarChart3 size={22} />
-            <span className="text-[10px] font-medium">Dashboard</span>
+        <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 flex justify-around p-1.5 pb-safe z-20 overflow-x-auto">
+          <button onClick={() => setAdminTab('dashboard')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 transition-colors ${adminTab === 'dashboard' ? 'text-blue-600' : 'text-slate-400'}`}>
+            <BarChart3 size={20} />
+            <span className="text-[9px] font-medium">Dashboard</span>
           </button>
-          <button onClick={() => setAdminTab('map')} className={`flex flex-col items-center gap-1 p-2 flex-1 transition-colors ${adminTab === 'map' ? 'text-blue-600' : 'text-slate-400'}`}>
-            <Map size={22} />
-            <span className="text-[10px] font-medium">Peta</span>
+          <button onClick={() => setAdminTab('map')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 transition-colors ${adminTab === 'map' ? 'text-blue-600' : 'text-slate-400'}`}>
+            <Map size={20} />
+            <span className="text-[9px] font-medium">Peta</span>
           </button>
-          <button onClick={() => setAdminTab('attendance')} className={`flex flex-col items-center gap-1 p-2 flex-1 transition-colors ${adminTab === 'attendance' ? 'text-blue-600' : 'text-slate-400'}`}>
-            <Clock size={22} />
-            <span className="text-[10px] font-medium">Absensi</span>
+          <button onClick={() => setAdminTab('attendance')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 transition-colors ${adminTab === 'attendance' ? 'text-blue-600' : 'text-slate-400'}`}>
+            <Clock size={20} />
+            <span className="text-[9px] font-medium">Absensi</span>
           </button>
-          <button onClick={() => setAdminTab('targets')} className={`flex flex-col items-center gap-1 p-2 flex-1 transition-colors ${adminTab === 'targets' ? 'text-blue-600' : 'text-slate-400'}`}>
-            <TargetIcon size={22} />
-            <span className="text-[10px] font-medium">Target</span>
+          <button onClick={() => setAdminTab('targets')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 transition-colors ${adminTab === 'targets' ? 'text-blue-600' : 'text-slate-400'}`}>
+            <TargetIcon size={20} />
+            <span className="text-[9px] font-medium">Target</span>
           </button>
-          <button onClick={() => setAdminTab('employees')} className={`flex flex-col items-center gap-1 p-2 flex-1 transition-colors ${adminTab === 'employees' ? 'text-blue-600' : 'text-slate-400'}`}>
-            <Users size={22} />
-            <span className="text-[10px] font-medium">Pegawai</span>
+          <button onClick={() => setAdminTab('reports')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 transition-colors ${adminTab === 'reports' ? 'text-blue-600' : 'text-slate-400'}`}>
+            <FileText size={20} />
+            <span className="text-[9px] font-medium">Laporan</span>
+          </button>
+          <button onClick={() => setAdminTab('employees')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 transition-colors ${adminTab === 'employees' ? 'text-blue-600' : 'text-slate-400'}`}>
+            <Users size={20} />
+            <span className="text-[9px] font-medium">Pegawai</span>
           </button>
         </nav>
       </div>
