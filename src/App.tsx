@@ -21,7 +21,7 @@ const AdminReports = lazy(() => import('./admin/AdminReports'));
 // ==========================================
 // Ganti string kosong di bawah dengan URL Web App Google Apps Script Anda saat siap integrasi.
 // Selama kosong, aplikasi berjalan di mode Sandbox (menggunakan LocalStorage)
-const GAS_API_URL = "";
+const GAS_API_URL = "https://script.google.com/macros/s/AKfycbw1WM795b0RuqMkb81m4GxBYsImwrfn9zwJYCq_scJp7e1rhIoZTZAkybXSwWiz9W7a/exec";
 
 // Kunci sederhana supaya endpoint Google Apps Script tidak bisa diakses
 // sembarang orang yang kebetulan menemukan URL-nya. Ganti ke teks bebas
