@@ -21,7 +21,7 @@ const AdminReports = lazy(() => import('./admin/AdminReports'));
 // ==========================================
 // Ganti string kosong di bawah dengan URL Web App Google Apps Script Anda saat siap integrasi.
 // Selama kosong, aplikasi berjalan di mode Sandbox (menggunakan LocalStorage)
-const GAS_API_URL = "https://script.google.com/macros/s/AKfycbw1WM795b0RuqMkb81m4GxBYsImwrfn9zwJYCq_scJp7e1rhIoZTZAkybXSwWiz9W7a/exec";
+const GAS_API_URL = "";
 
 // Kunci sederhana supaya endpoint Google Apps Script tidak bisa diakses
 // sembarang orang yang kebetulan menemukan URL-nya. Ganti ke teks bebas
@@ -147,7 +147,7 @@ const defaultVisits: Visit[] = [
 const defaultAttendance: Attendance[] = [];
 const defaultTargets: Target[] = [];
 
-const FETCH_TIMEOUT_MS = 10000;
+const FETCH_TIMEOUT_MS = 25000; // 25 detik - upload foto ke Google Drive lewat Apps Script bisa lambat
 const MAX_RETRY = 2;
 
 function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = FETCH_TIMEOUT_MS) {
@@ -215,6 +215,59 @@ const db = {
       }
     } else {
       localStorage.setItem(`esgaruda_${collection}`, JSON.stringify(data));
+      return { ok: true };
+    }
+  },
+  // Menambahkan SATU catatan baru (kunjungan/absensi baru) tanpa mengirim
+  // ulang seluruh riwayat - supaya tidak ada risiko dua penyimpanan yang
+  // waktunya berdekatan saling menimpa data satu sama lain.
+  async append(collection: string, fullArrayForCache: any[], newItem: any): Promise<{ ok: boolean, error?: string }> {
+    localStorage.setItem(`esgaruda_cache_${collection}`, JSON.stringify(fullArrayForCache));
+
+    if (GAS_API_URL) {
+      try {
+        const res = await fetchWithRetry(GAS_API_URL, {
+          method: 'POST',
+          body: JSON.stringify({ action: 'append', collection, item: newItem, key: GAS_API_KEY }),
+        });
+        const json = await res.json().catch(() => null);
+        if (json && json.error) {
+          console.error(`API Error (append "${collection}"):`, json.error);
+          return { ok: false, error: json.error };
+        }
+        return { ok: true };
+      } catch (err) {
+        console.error(`API Error (append "${collection}"):`, err);
+        return { ok: false, error: String(err) };
+      }
+    } else {
+      localStorage.setItem(`esgaruda_${collection}`, JSON.stringify(fullArrayForCache));
+      return { ok: true };
+    }
+  },
+  // Memperbarui SATU catatan yang sudah ada (dicari berdasarkan id), misalnya
+  // mengisi jam pulang pada catatan absen masuk yang sudah tersimpan.
+  async upsert(collection: string, fullArrayForCache: any[], item: any): Promise<{ ok: boolean, error?: string }> {
+    localStorage.setItem(`esgaruda_cache_${collection}`, JSON.stringify(fullArrayForCache));
+
+    if (GAS_API_URL) {
+      try {
+        const res = await fetchWithRetry(GAS_API_URL, {
+          method: 'POST',
+          body: JSON.stringify({ action: 'upsert', collection, item, key: GAS_API_KEY }),
+        });
+        const json = await res.json().catch(() => null);
+        if (json && json.error) {
+          console.error(`API Error (upsert "${collection}"):`, json.error);
+          return { ok: false, error: json.error };
+        }
+        return { ok: true };
+      } catch (err) {
+        console.error(`API Error (upsert "${collection}"):`, err);
+        return { ok: false, error: String(err) };
+      }
+    } else {
+      localStorage.setItem(`esgaruda_${collection}`, JSON.stringify(fullArrayForCache));
       return { ok: true };
     }
   }
@@ -1154,6 +1207,26 @@ export default function App() {
     }
   };
 
+  const appendToDB = async (collection: string, fullArray: any[], newItem: any) => {
+    setSyncing(true);
+    const result = await db.append(collection, fullArray, newItem);
+    setSyncing(false);
+    if (!result.ok) {
+      setSyncError(`Gagal menyimpan "${collection}" ke server. Data tersimpan sementara di HP ini, coba sinkron ulang nanti.`);
+      setTimeout(() => setSyncError(null), 7000);
+    }
+  };
+
+  const upsertToDB = async (collection: string, fullArray: any[], item: any) => {
+    setSyncing(true);
+    const result = await db.upsert(collection, fullArray, item);
+    setSyncing(false);
+    if (!result.ok) {
+      setSyncError(`Gagal menyimpan "${collection}" ke server. Data tersimpan sementara di HP ini, coba sinkron ulang nanti.`);
+      setTimeout(() => setSyncError(null), 7000);
+    }
+  };
+
   const handleUsersUpdate = (newUsers: User[]) => {
     setUsers(newUsers);
     syncToDB('users', newUsers);
@@ -1232,7 +1305,7 @@ export default function App() {
   const handleAddVisit = (newVisit: Visit) => {
     const updatedVisits = [newVisit, ...visits];
     setVisits(updatedVisits);
-    syncToDB('visits', updatedVisits);
+    appendToDB('visits', updatedVisits, newVisit);
     setCurrentTab('home');
   };
 
@@ -1285,7 +1358,7 @@ export default function App() {
         };
         const updated = [newAtt, ...attendance];
         setAttendance(updated);
-        syncToDB('attendance', updated);
+        appendToDB('attendance', updated, newAtt);
         setAttendanceLoading(false);
       },
       () => { alert('Gagal mengambil lokasi GPS. Pastikan GPS aktif.'); setAttendanceLoading(false); },
@@ -1316,11 +1389,10 @@ export default function App() {
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         const timeStr = new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
-        const updated = attendance.map(a => a.id === attendanceToday.id
-          ? { ...a, checkOutTime: timeStr, checkOutLat: pos.coords.latitude, checkOutLng: pos.coords.longitude }
-          : a);
+        const updatedRecord = { ...attendanceToday, checkOutTime: timeStr, checkOutLat: pos.coords.latitude, checkOutLng: pos.coords.longitude };
+        const updated = attendance.map(a => a.id === attendanceToday.id ? updatedRecord : a);
         setAttendance(updated);
-        syncToDB('attendance', updated);
+        upsertToDB('attendance', updated, updatedRecord);
         setAttendanceLoading(false);
       },
       () => { alert('Gagal mengambil lokasi GPS. Pastikan GPS aktif.'); setAttendanceLoading(false); },
