@@ -21,7 +21,7 @@ const AdminReports = lazy(() => import('./admin/AdminReports'));
 // ==========================================
 // Ganti string kosong di bawah dengan URL Web App Google Apps Script Anda saat siap integrasi.
 // Selama kosong, aplikasi berjalan di mode Sandbox (menggunakan LocalStorage)
-const GAS_API_URL = "https://script.google.com/macros/s/AKfycbw1WM795b0RuqMkb81m4GxBYsImwrfn9zwJYCq_scJp7e1rhIoZTZAkybXSwWiz9W7a/exec";
+const GAS_API_URL = "";
 
 // Kunci sederhana supaya endpoint Google Apps Script tidak bisa diakses
 // sembarang orang yang kebetulan menemukan URL-nya. Ganti ke teks bebas
@@ -225,6 +225,7 @@ const db = {
     localStorage.setItem(`esgaruda_cache_${collection}`, JSON.stringify(fullArrayForCache));
 
     if (GAS_API_URL) {
+      console.log(`[EKG] Mengirim data baru ke "${collection}"...`, newItem.id);
       try {
         const res = await fetchWithRetry(GAS_API_URL, {
           method: 'POST',
@@ -232,12 +233,13 @@ const db = {
         });
         const json = await res.json().catch(() => null);
         if (json && json.error) {
-          console.error(`API Error (append "${collection}"):`, json.error);
+          console.error(`[EKG] Gagal simpan ke "${collection}":`, json.error);
           return { ok: false, error: json.error };
         }
+        console.log(`[EKG] Berhasil simpan ke "${collection}".`, json);
         return { ok: true };
       } catch (err) {
-        console.error(`API Error (append "${collection}"):`, err);
+        console.error(`[EKG] Gagal simpan ke "${collection}" (network/timeout):`, err);
         return { ok: false, error: String(err) };
       }
     } else {
@@ -572,13 +574,56 @@ const CanvassingForm = ({ user, onSubmit }: { user: User, onSubmit: (v: any) => 
     }
   };
 
+  const [compressingPhoto, setCompressingPhoto] = useState(false);
+
   const handlePhotoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setPhotoError('');
+    setCompressingPhoto(true);
+
     const reader = new FileReader();
-    reader.onload = () => setPhoto(reader.result as string);
-    reader.onerror = () => setPhotoError('Gagal memuat foto, coba ambil ulang.');
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        // Perkecil foto sebelum disimpan - foto asli dari kamera HP bisa
+        // beberapa MB dan bikin proses kirim/unggah ke server sangat lambat
+        // (bahkan bisa gagal tanpa pesan error yang jelas).
+        const MAX_DIMENSION = 1280;
+        let { width, height } = img;
+        if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
+          if (width > height) {
+            height = Math.round((height * MAX_DIMENSION) / width);
+            width = MAX_DIMENSION;
+          } else {
+            width = Math.round((width * MAX_DIMENSION) / height);
+            height = MAX_DIMENSION;
+          }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          setPhotoError('Gagal memproses foto, coba ambil ulang.');
+          setCompressingPhoto(false);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, width, height);
+        const compressed = canvas.toDataURL('image/jpeg', 0.7);
+        setPhoto(compressed);
+        setCompressingPhoto(false);
+      };
+      img.onerror = () => {
+        setPhotoError('Gagal memuat foto, coba ambil ulang.');
+        setCompressingPhoto(false);
+      };
+      img.src = reader.result as string;
+    };
+    reader.onerror = () => {
+      setPhotoError('Gagal memuat foto, coba ambil ulang.');
+      setCompressingPhoto(false);
+    };
     reader.readAsDataURL(file);
   };
 
@@ -665,7 +710,12 @@ const CanvassingForm = ({ user, onSubmit }: { user: User, onSubmit: (v: any) => 
 
           <div className="mb-4">
             <label className="block text-sm font-medium text-slate-600 mb-1.5">Foto Depan Toko (Wajib) <span className="text-red-500">*</span></label>
-            {photo ? (
+            {compressingPhoto ? (
+              <div className="border-2 border-dashed border-slate-300 bg-slate-50 rounded-xl p-6 text-center">
+                <RefreshCw size={28} className="mx-auto text-slate-400 mb-2 animate-spin" />
+                <span className="text-sm font-medium text-slate-600">Memproses foto...</span>
+              </div>
+            ) : photo ? (
               <div className="relative">
                 <img src={photo} alt="Preview toko" className="w-full h-40 object-cover rounded-xl border border-slate-200" />
                 <button type="button" onClick={() => setPhoto(null)} className="absolute top-2 right-2 bg-white/90 p-1.5 rounded-full shadow text-red-500 hover:bg-white">
@@ -706,8 +756,8 @@ const CanvassingForm = ({ user, onSubmit }: { user: User, onSubmit: (v: any) => 
           </div>
         </Card>
 
-        <Button type="submit" variant="primary" disabled={submitting} className="py-4 text-lg mt-6 shadow-xl w-full sticky bottom-20 z-10">
-          {submitting ? 'Menyimpan...' : 'Kirim Laporan Kunjungan'}
+        <Button type="submit" variant="primary" disabled={submitting || compressingPhoto} className="py-4 text-lg mt-6 shadow-xl w-full sticky bottom-20 z-10">
+          {compressingPhoto ? 'Memproses foto...' : submitting ? 'Menyimpan...' : 'Kirim Laporan Kunjungan'}
         </Button>
       </form>
     </div>
