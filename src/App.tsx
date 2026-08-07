@@ -6,7 +6,7 @@ import {
   LogIn, LogOut, Users, ShieldCheck, Eye, EyeOff, Pencil, Smartphone, Database, WifiOff, RefreshCw, Info, AlertTriangle, Search, FileSpreadsheet, Camera
 } from "lucide-react";
 
-const GAS_URL = "https://script.google.com/macros/s/AKfycbxMiMaPV76CrWqiAmRPnSHp9IrxAJHFPuMhUyfmxZIbHa33idwjyV9HdSCZrpQHIgdc/exec"; 
+const GAS_URL = "https://script.google.com/macros/s/AKfycbw1WM795b0RuqMkb81m4GxBYsImwrfn9zwJYCq_scJp7e1rhIoZTZAkybXSwWiz9W7a/exec"; 
 
 const pad = (n) => String(n).padStart(2, "0");
 const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
