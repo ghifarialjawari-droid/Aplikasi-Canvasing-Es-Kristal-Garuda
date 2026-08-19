@@ -133,7 +133,7 @@ const AdminDashboard = ({
 
   const totalVisits = filteredVisits.length;
   const newShops = filteredVisits.filter(v => v.isNewCustomer).length;
-  const totalProspek = filteredVisits.filter(v => v.status === 'Prospek' || v.status === 'Follow Up').length;
+  const totalProspek = filteredVisits.filter(v => v.status === 'Prospek').length;
   const visitsToday = filteredVisits.filter(v => v.date === todayStr).length;
 
   // Pegawai yang belum absen hari ini
@@ -249,7 +249,7 @@ const AdminDashboard = ({
           <p className="text-3xl font-black text-slate-800 mt-2">{newShops}</p>
         </Card>
         <Card className="p-6 border-l-4 border-l-yellow-500">
-          <p className="text-slate-500 text-sm font-medium">Dalam Prospek & Follow Up</p>
+          <p className="text-slate-500 text-sm font-medium">Dalam Prospek</p>
           <p className="text-3xl font-black text-slate-800 mt-2">{totalProspek}</p>
         </Card>
         <Card className="p-6 border-l-4 border-l-indigo-500">

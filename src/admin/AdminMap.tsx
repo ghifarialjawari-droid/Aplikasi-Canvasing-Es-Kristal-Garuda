@@ -76,18 +76,14 @@ const Select = ({ label, value, onChange, options, required = false }: any) => (
 
 const statusColorHex: Record<string, string> = {
   'Closing': '#10b981',
-  'Prospek': '#2563eb',
-  'Follow Up': '#eab308',
-  'Menolak': '#ef4444',
+  'Prospek': '#f472b6',
 };
 const getStatusHex = (status: string) => statusColorHex[status] || '#94a3b8';
 
 const getStatusColorClasses = (status: string) => {
   switch (status) {
     case 'Closing': return 'bg-emerald-500 border-emerald-200';
-    case 'Prospek': return 'bg-blue-500 border-blue-200';
-    case 'Follow Up': return 'bg-yellow-500 border-yellow-200';
-    case 'Menolak': return 'bg-red-500 border-red-200';
+    case 'Prospek': return 'bg-pink-400 border-pink-200';
     default: return 'bg-slate-400 border-slate-200';
   }
 };
@@ -105,7 +101,7 @@ const AdminMap = ({ visits, users }: { visits: Visit[], users: User[] }) => {
 
   const cabangList = ['Semua', ...Array.from(new Set(users.filter(u => u.role === 'pegawai').map(u => u.cabang)))];
   const pegawaiList = ['Semua', ...users.filter(u => u.role === 'pegawai' && (filterCabang === 'Semua' || u.cabang === filterCabang)).map(u => u.name)];
-  const statusList = ['Semua', 'Prospek', 'Closing', 'Follow Up', 'Menolak', 'Sudah Pakai Es', 'Belum Pakai Es'];
+  const statusList = ['Semua', 'Closing', 'Prospek'];
 
   const filteredVisits = visits.filter(v => {
     const peg = users.find(u => u.id === v.pegawaiId);
@@ -185,10 +181,8 @@ const AdminMap = ({ visits, users }: { visits: Visit[], users: User[] }) => {
         <div ref={mapDivRef} className="w-full h-full z-0" />
 
         <div className="absolute top-4 left-4 z-[400] bg-white/90 p-4 rounded-xl shadow-md border border-white backdrop-blur text-sm font-medium space-y-2 pointer-events-none">
-          <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-emerald-500"></div> Sukses/Closing</div>
-          <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-blue-500"></div> Prospek Baru</div>
-          <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-yellow-500"></div> Perlu Follow Up</div>
-          <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-red-500"></div> Menolak</div>
+          <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-emerald-500"></div> Closing</div>
+          <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-pink-400"></div> Prospek</div>
         </div>
 
         {selectedMarker && (
@@ -202,21 +196,15 @@ const AdminMap = ({ visits, users }: { visits: Visit[], users: User[] }) => {
             </div>
 
             <div className="space-y-3 text-sm">
-              <div className="flex justify-between border-b pb-2"><span className="text-slate-500">Pemilik</span> <span className="font-medium text-slate-800">{selectedMarker.owner}</span></div>
-              <div className="flex justify-between border-b pb-2"><span className="text-slate-500">No HP</span> <span className="font-medium text-slate-800">{selectedMarker.phone}</span></div>
+              {selectedMarker.phone && (
+                <div className="flex justify-between border-b pb-2"><span className="text-slate-500">No HP</span> <span className="font-medium text-slate-800">{selectedMarker.phone}</span></div>
+              )}
               <div className="flex justify-between border-b pb-2"><span className="text-slate-500">Pegawai (Sales)</span> <span className="font-medium text-blue-600">{users.find(u => u.id === selectedMarker.pegawaiId)?.name}</span></div>
               <div className="flex justify-between border-b pb-2"><span className="text-slate-500">Toko Baru?</span> <span className="font-medium text-slate-800">{selectedMarker.isNewCustomer ? 'Ya' : 'Tidak'}</span></div>
               <div className="flex justify-between border-b pb-2"><span className="text-slate-500">Status</span>
                 <span className={`px-2 py-0.5 rounded-full text-xs font-bold text-white ${getStatusColorClasses(selectedMarker.status).split(' ')[0]}`}>{selectedMarker.status}</span>
               </div>
               <div className="flex justify-between border-b pb-2"><span className="text-slate-500">Tgl Kunjungan</span> <span className="font-medium text-slate-800">{selectedMarker.date} {selectedMarker.time}</span></div>
-              {selectedMarker.nextFollowUp && (
-                <div className="flex justify-between border-b pb-2"><span className="text-slate-500 font-bold text-yellow-600">Janji Follow Up</span> <span className="font-bold text-slate-800">{selectedMarker.nextFollowUp}</span></div>
-              )}
-              <div>
-                <span className="text-slate-500 block mb-1">Catatan Laporan:</span>
-                <p className="bg-slate-50 p-2 rounded-lg text-slate-700 italic border border-slate-100">{selectedMarker.result}</p>
-              </div>
               <div className="flex gap-2 mt-4">
                 <Button variant="outline" className="w-1/2 py-2 text-sm" onClick={() => setShowPhoto(true)} disabled={!selectedMarker.photo}>
                   <ImageIcon size={16} /> Lihat Foto

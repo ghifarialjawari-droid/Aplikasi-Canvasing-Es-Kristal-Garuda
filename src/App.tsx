@@ -21,7 +21,7 @@ const AdminReports = lazy(() => import('./admin/AdminReports'));
 // ==========================================
 // Ganti string kosong di bawah dengan URL Web App Google Apps Script Anda saat siap integrasi.
 // Selama kosong, aplikasi berjalan di mode Sandbox (menggunakan LocalStorage)
-const GAS_API_URL = "https://script.google.com/macros/s/AKfycbw1WM795b0RuqMkb81m4GxBYsImwrfn9zwJYCq_scJp7e1rhIoZTZAkybXSwWiz9W7a/exec";
+const GAS_API_URL = "";
 
 // Kunci sederhana supaya endpoint Google Apps Script tidak bisa diakses
 // sembarang orang yang kebetulan menemukan URL-nya. Ganti ke teks bebas
@@ -54,7 +54,7 @@ interface Visit {
   cabang: string;
   lat: number | null;
   lng: number | null;
-  status: string; // Prospek, Closing, Follow Up, Menolak
+  status: string; // Closing atau Prospek
   result: string;
   isNewCustomer: boolean;
   nextFollowUp?: string;
@@ -146,6 +146,7 @@ const defaultVisits: Visit[] = [
 
 const defaultAttendance: Attendance[] = [];
 const defaultTargets: Target[] = [];
+const defaultBusinessTypes: string[] = ['Warung', 'Agen', 'Rumah Makan', 'Cafe', 'Pedagang Minuman', 'Catering', 'Lainnya'];
 
 const FETCH_TIMEOUT_MS = 25000; // 25 detik - upload foto ke Google Drive lewat Apps Script bisa lambat
 const MAX_RETRY = 2;
@@ -541,9 +542,45 @@ const PegawaiDashboard = ({
   );
 };
 
-const CanvassingForm = ({ user, onSubmit }: { user: User, onSubmit: (v: any) => void }) => {
+// Mengecilkan/mengompres foto sebelum disimpan - foto asli dari kamera HP
+// bisa beberapa MB dan bikin proses kirim/unggah ke server sangat lambat.
+// Dipakai baik saat input kunjungan baru maupun saat edit foto belakangan.
+function compressImageFile(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const MAX_DIMENSION = 1280;
+        let { width, height } = img;
+        if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
+          if (width > height) {
+            height = Math.round((height * MAX_DIMENSION) / width);
+            width = MAX_DIMENSION;
+          } else {
+            width = Math.round((width * MAX_DIMENSION) / height);
+            height = MAX_DIMENSION;
+          }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) { reject(new Error('Canvas tidak didukung di browser ini.')); return; }
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', 0.7));
+      };
+      img.onerror = () => reject(new Error('Gagal memuat foto.'));
+      img.src = reader.result as string;
+    };
+    reader.onerror = () => reject(new Error('Gagal membaca file foto.'));
+    reader.readAsDataURL(file);
+  });
+}
+
+const CanvassingForm = ({ user, onSubmit, businessTypes }: { user: User, onSubmit: (v: any) => void, businessTypes: string[] }) => {
   const [formData, setFormData] = useState({
-    shopName: '', owner: '', phone: '', businessType: '', status: '', result: '', nextFollowUp: ''
+    shopName: '', phone: '', businessType: '', status: ''
   });
   const [isNewCustomer, setIsNewCustomer] = useState(false);
   const [location, setLocation] = useState<{ lat: number, lng: number } | null>(null);
@@ -552,6 +589,7 @@ const CanvassingForm = ({ user, onSubmit }: { user: User, onSubmit: (v: any) => 
   const [photo, setPhoto] = useState<string | null>(null);
   const [photoError, setPhotoError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [compressingPhoto, setCompressingPhoto] = useState(false);
 
   const getLocation = () => {
     setLocating(true);
@@ -574,67 +612,21 @@ const CanvassingForm = ({ user, onSubmit }: { user: User, onSubmit: (v: any) => 
     }
   };
 
-  const [compressingPhoto, setCompressingPhoto] = useState(false);
-
   const handlePhotoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setPhotoError('');
     setCompressingPhoto(true);
-
-    const reader = new FileReader();
-    reader.onload = () => {
-      const img = new Image();
-      img.onload = () => {
-        // Perkecil foto sebelum disimpan - foto asli dari kamera HP bisa
-        // beberapa MB dan bikin proses kirim/unggah ke server sangat lambat
-        // (bahkan bisa gagal tanpa pesan error yang jelas).
-        const MAX_DIMENSION = 1280;
-        let { width, height } = img;
-        if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
-          if (width > height) {
-            height = Math.round((height * MAX_DIMENSION) / width);
-            width = MAX_DIMENSION;
-          } else {
-            width = Math.round((width * MAX_DIMENSION) / height);
-            height = MAX_DIMENSION;
-          }
-        }
-        const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          setPhotoError('Gagal memproses foto, coba ambil ulang.');
-          setCompressingPhoto(false);
-          return;
-        }
-        ctx.drawImage(img, 0, 0, width, height);
-        const compressed = canvas.toDataURL('image/jpeg', 0.7);
-        setPhoto(compressed);
-        setCompressingPhoto(false);
-      };
-      img.onerror = () => {
-        setPhotoError('Gagal memuat foto, coba ambil ulang.');
-        setCompressingPhoto(false);
-      };
-      img.src = reader.result as string;
-    };
-    reader.onerror = () => {
-      setPhotoError('Gagal memuat foto, coba ambil ulang.');
-      setCompressingPhoto(false);
-    };
-    reader.readAsDataURL(file);
+    compressImageFile(file)
+      .then(setPhoto)
+      .catch(() => setPhotoError('Gagal memproses foto, coba ambil ulang.'))
+      .finally(() => setCompressingPhoto(false));
   };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!location) {
       alert("Lokasi GPS WAJIB diambil sebelum submit form!");
-      return;
-    }
-    if (!photo) {
-      alert("Foto depan toko WAJIB diambil sebelum submit form!");
       return;
     }
     if (!formData.shopName.trim()) {
@@ -646,26 +638,26 @@ const CanvassingForm = ({ user, onSubmit }: { user: User, onSubmit: (v: any) => 
       id: Date.now().toString(),
       date: new Date().toISOString().split('T')[0],
       time: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
-      ...formData,
       shopName: formData.shopName.trim(),
-      owner: formData.owner.trim(),
+      owner: '',
       phone: formData.phone.trim(),
-      result: formData.result.trim(),
+      businessType: formData.businessType,
+      status: formData.status,
+      result: '',
       isNewCustomer,
       lat: location.lat,
       lng: location.lng,
       cabang: user.cabang,
       area: user.area || '',
       pegawaiId: user.id,
-      photo: photo,
+      photo: photo || '',
     };
     onSubmit(newVisit);
     alert("Data Kunjungan Canvassing berhasil disimpan!");
     setSubmitting(false);
   };
 
-  const businessTypes = ['Warung', 'Agen', 'Rumah Makan', 'Cafe', 'Pedagang Minuman', 'Catering', 'Lainnya'];
-  const statuses = ['Prospek', 'Follow Up', 'Closing', 'Menolak', 'Sudah Pakai Es', 'Belum Pakai Es', 'Tidak Beroperasi'];
+  const statuses = ['Closing', 'Prospek'];
 
   return (
     <div className="p-4 pb-24">
@@ -684,8 +676,7 @@ const CanvassingForm = ({ user, onSubmit }: { user: User, onSubmit: (v: any) => 
           </div>
 
           <Input label="Nama Toko/Usaha" required value={formData.shopName} onChange={(e: any) => setFormData({ ...formData, shopName: e.target.value })} placeholder="Cth: Warung Makmur" />
-          <Input label="Nama Pemilik" value={formData.owner} onChange={(e: any) => setFormData({ ...formData, owner: e.target.value })} placeholder="Cth: Bpk. Joko" />
-          <Input label="Nomor WhatsApp/HP" type="tel" value={formData.phone} onChange={(e: any) => setFormData({ ...formData, phone: e.target.value })} placeholder="08..." />
+          <Input label="Nomor WhatsApp/HP (Opsional, bisa diisi belakangan)" type="tel" value={formData.phone} onChange={(e: any) => setFormData({ ...formData, phone: e.target.value })} placeholder="08..." />
           <Select label="Jenis Usaha" options={businessTypes} required value={formData.businessType} onChange={(e: any) => setFormData({ ...formData, businessType: e.target.value })} />
         </Card>
 
@@ -709,7 +700,7 @@ const CanvassingForm = ({ user, onSubmit }: { user: User, onSubmit: (v: any) => 
           </div>
 
           <div className="mb-4">
-            <label className="block text-sm font-medium text-slate-600 mb-1.5">Foto Depan Toko (Wajib) <span className="text-red-500">*</span></label>
+            <label className="block text-sm font-medium text-slate-600 mb-1.5">Foto Depan Toko (Opsional, bisa ditambah belakangan)</label>
             {compressingPhoto ? (
               <div className="border-2 border-dashed border-slate-300 bg-slate-50 rounded-xl p-6 text-center">
                 <RefreshCw size={28} className="mx-auto text-slate-400 mb-2 animate-spin" />
@@ -734,26 +725,8 @@ const CanvassingForm = ({ user, onSubmit }: { user: User, onSubmit: (v: any) => 
         </Card>
 
         <Card className="p-5">
-          <h3 className="font-bold text-slate-800 mb-4 border-b pb-2">Status & Laporan Kunjungan</h3>
+          <h3 className="font-bold text-slate-800 mb-4 border-b pb-2">Status Kunjungan</h3>
           <Select label="Status Kunjungan Hari Ini" options={statuses} required value={formData.status} onChange={(e: any) => setFormData({ ...formData, status: e.target.value })} />
-
-          {formData.status === 'Follow Up' && (
-            <div className="bg-yellow-50 p-4 rounded-xl mb-4 border border-yellow-100 animate-in fade-in zoom-in duration-300">
-              <Input label="Tanggal Janji Follow Up" type="date" required value={formData.nextFollowUp} onChange={(e: any) => setFormData({ ...formData, nextFollowUp: e.target.value })} />
-            </div>
-          )}
-
-          <div className="mb-4">
-            <label className="block text-sm font-medium text-slate-600 mb-1.5">Catatan Laporan Kunjungan <span className="text-red-500">*</span></label>
-            <textarea
-              required
-              rows={4}
-              value={formData.result}
-              onChange={(e) => setFormData({ ...formData, result: e.target.value })}
-              placeholder="Ceritakan hasil kunjungan. Cth: Toko tertarik, namun masih ada sisa stok es lama. Minta dihubungi lagi hari rabu..."
-              className="w-full bg-slate-50 border border-slate-200 text-slate-800 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all resize-none"
-            ></textarea>
-          </div>
         </Card>
 
         <Button type="submit" variant="primary" disabled={submitting || compressingPhoto} className="py-4 text-lg mt-6 shadow-xl w-full sticky bottom-20 z-10">
@@ -960,7 +933,8 @@ const AdminAttendance = ({
   );
 };
 
-const AdminEmployees = ({ users, setUsers, addAuditLog, targets, onUpdateTargets }: { users: User[], setUsers: any, addAuditLog: any, targets: Target[], onUpdateTargets: (t: Target[]) => void }) => {
+const AdminEmployees = ({ users, setUsers, addAuditLog, targets, onUpdateTargets, businessTypes, onUpdateBusinessTypes }: { users: User[], setUsers: any, addAuditLog: any, targets: Target[], onUpdateTargets: (t: Target[]) => void, businessTypes: string[], onUpdateBusinessTypes: (b: string[]) => void }) => {
+  const [newBusinessType, setNewBusinessType] = useState('');
   const [showModal, setShowModal] = useState<'add' | 'edit' | 'reset' | null>(null);
   const [selectedUser, setSelectedUser] = useState<User | null>(null);
   const [formData, setFormData] = useState<any>({});
@@ -1108,6 +1082,52 @@ const AdminEmployees = ({ users, setUsers, addAuditLog, targets, onUpdateTargets
         </div>
       </Card>
 
+      <Card className="p-6">
+        <h3 className="font-bold text-slate-800 mb-1">Kelola Jenis Usaha</h3>
+        <p className="text-xs text-slate-500 mb-4">Daftar pilihan "Jenis Usaha" yang muncul di form Canvasing pegawai. Tambah atau hapus sesuai kebutuhan.</p>
+        <div className="flex flex-wrap gap-2 mb-4">
+          {businessTypes.map((bt) => (
+            <span key={bt} className="flex items-center gap-1.5 bg-blue-50 text-blue-700 text-sm font-medium px-3 py-1.5 rounded-full">
+              {bt}
+              <button
+                onClick={() => onUpdateBusinessTypes(businessTypes.filter((x) => x !== bt))}
+                className="text-blue-400 hover:text-red-500"
+                title={`Hapus ${bt}`}
+              >
+                <X size={14} />
+              </button>
+            </span>
+          ))}
+          {businessTypes.length === 0 && <p className="text-sm text-slate-400">Belum ada jenis usaha. Tambahkan minimal satu.</p>}
+        </div>
+        <div className="flex gap-2">
+          <input
+            value={newBusinessType}
+            onChange={(e) => setNewBusinessType(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                const v = newBusinessType.trim();
+                if (v && !businessTypes.includes(v)) onUpdateBusinessTypes([...businessTypes, v]);
+                setNewBusinessType('');
+              }
+            }}
+            placeholder="Tambah jenis usaha baru, cth: Toko Kelontong"
+            className="flex-1 bg-slate-50 border border-slate-200 text-slate-800 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+          <button
+            onClick={() => {
+              const v = newBusinessType.trim();
+              if (v && !businessTypes.includes(v)) onUpdateBusinessTypes([...businessTypes, v]);
+              setNewBusinessType('');
+            }}
+            className="px-4 py-2.5 bg-blue-600 text-white rounded-xl font-semibold hover:bg-blue-700 flex items-center gap-2"
+          >
+            <PlusCircle size={16} /> Tambah
+          </button>
+        </div>
+      </Card>
+
       {/* MODALS */}
       {showModal && (
         <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
@@ -1163,12 +1183,124 @@ const AdminEmployees = ({ users, setUsers, addAuditLog, targets, onUpdateTargets
   );
 }
 
+const PegawaiHistory = ({
+  user, visits, onEditVisit
+}: {
+  user: User, visits: Visit[], onEditVisit: (visitId: string, updates: { phone?: string, photo?: string }) => void
+}) => {
+  const [editingVisit, setEditingVisit] = useState<Visit | null>(null);
+  const [editPhone, setEditPhone] = useState('');
+  const [editPhoto, setEditPhoto] = useState<string | null>(null);
+  const [compressing, setCompressing] = useState(false);
+  const [photoError, setPhotoError] = useState('');
+
+  const myVisits = visits.filter(v => v.pegawaiId === user.id);
+
+  const openEdit = (v: Visit) => {
+    setEditingVisit(v);
+    setEditPhone(v.phone || '');
+    setEditPhoto(v.photo || null);
+    setPhotoError('');
+  };
+
+  const handleEditPhotoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setPhotoError('');
+    setCompressing(true);
+    compressImageFile(file)
+      .then(setEditPhoto)
+      .catch(() => setPhotoError('Gagal memproses foto, coba ambil ulang.'))
+      .finally(() => setCompressing(false));
+  };
+
+  const handleSaveEdit = () => {
+    if (!editingVisit) return;
+    onEditVisit(editingVisit.id, { phone: editPhone.trim(), photo: editPhoto || '' });
+    setEditingVisit(null);
+  };
+
+  return (
+    <div className="p-4 pb-24 space-y-4">
+      <h2 className="text-xl font-bold text-slate-800 mb-4">Riwayat Kunjungan Saya</h2>
+      {myVisits.map(v => (
+        <Card key={v.id} className="p-4 flex flex-col gap-2 border-l-4 border-l-blue-500">
+          <div className="flex justify-between items-start">
+            <div>
+              <h4 className="font-bold text-slate-800 flex items-center gap-1">
+                {v.shopName} {v.isNewCustomer && <span className="bg-yellow-100 text-yellow-700 text-[10px] px-2 py-0.5 rounded-full ml-1 font-bold">Baru</span>}
+              </h4>
+              <p className="text-xs text-slate-500 flex items-center gap-1 mt-1"><MapPin size={12} /> {v.businessType}</p>
+              {v.phone && <p className="text-xs text-slate-400 mt-0.5">{v.phone}</p>}
+            </div>
+            <span className={`text-[10px] px-2 py-1 rounded-full font-bold uppercase ${v.status === 'Closing' ? 'bg-emerald-100 text-emerald-700' : 'bg-pink-100 text-pink-700'}`}>
+              {v.status}
+            </span>
+          </div>
+          <div className="flex items-center justify-between mt-2 border-t pt-2">
+            <span className="text-xs text-slate-400">{v.date} &bull; {v.time}</span>
+            <button onClick={() => openEdit(v)} className="text-xs font-semibold text-blue-600 flex items-center gap-1 hover:text-blue-700">
+              <Edit size={12} /> {v.photo ? 'Edit Foto/No HP' : 'Lengkapi Foto/No HP'}
+            </button>
+          </div>
+        </Card>
+      ))}
+      {myVisits.length === 0 && (
+        <p className="text-sm text-slate-400 text-center py-8">Belum ada riwayat kunjungan.</p>
+      )}
+
+      {editingVisit && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <Card className="w-full max-w-sm p-6">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="font-bold text-slate-800">{editingVisit.shopName}</h3>
+              <button onClick={() => setEditingVisit(null)} className="p-1 text-slate-400 hover:text-red-500"><X size={18} /></button>
+            </div>
+
+            <Input label="Nomor WhatsApp/HP" type="tel" value={editPhone} onChange={(e: any) => setEditPhone(e.target.value)} placeholder="08..." />
+
+            <div className="mb-2">
+              <label className="block text-sm font-medium text-slate-600 mb-1.5">Foto Depan Toko</label>
+              {compressing ? (
+                <div className="border-2 border-dashed border-slate-300 bg-slate-50 rounded-xl p-6 text-center">
+                  <RefreshCw size={24} className="mx-auto text-slate-400 mb-2 animate-spin" />
+                  <span className="text-sm font-medium text-slate-600">Memproses foto...</span>
+                </div>
+              ) : editPhoto ? (
+                <div className="relative">
+                  <img src={editPhoto} alt="Preview toko" className="w-full h-40 object-cover rounded-xl border border-slate-200" />
+                  <button type="button" onClick={() => setEditPhoto(null)} className="absolute top-2 right-2 bg-white/90 p-1.5 rounded-full shadow text-red-500 hover:bg-white">
+                    <X size={16} />
+                  </button>
+                </div>
+              ) : (
+                <div className="border-2 border-dashed border-slate-300 bg-slate-50 rounded-xl p-6 text-center cursor-pointer hover:bg-slate-100 transition-colors relative">
+                  <input type="file" accept="image/*" capture="environment" onChange={handleEditPhotoChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
+                  <Camera size={28} className="mx-auto text-slate-400 mb-2" />
+                  <span className="text-sm font-medium text-slate-600">Buka Kamera / Upload</span>
+                </div>
+              )}
+              {photoError && <p className="text-red-500 text-xs mt-1">{photoError}</p>}
+            </div>
+
+            <div className="flex gap-3 pt-4 border-t mt-4">
+              <Button variant="outline" onClick={() => setEditingVisit(null)} className="flex-1">Batal</Button>
+              <Button variant="primary" onClick={handleSaveEdit} disabled={compressing} className="flex-1">Simpan</Button>
+            </div>
+          </Card>
+        </div>
+      )}
+    </div>
+  );
+};
+
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [users, setUsers] = useState<User[]>([]);
   const [visits, setVisits] = useState<Visit[]>([]);
   const [attendance, setAttendance] = useState<Attendance[]>([]);
   const [targets, setTargets] = useState<Target[]>([]);
+  const [businessTypes, setBusinessTypes] = useState<string[]>(defaultBusinessTypes);
   const [attendanceSettings, setAttendanceSettings] = useState<AttendanceSettings>(defaultAttendanceSettings);
   const [currentTab, setCurrentTab] = useState<'home' | 'canvassing' | 'history'>('home');
   const [adminTab, setAdminTab] = useState<'dashboard' | 'map' | 'employees' | 'attendance' | 'targets' | 'reports'>('dashboard');
@@ -1207,6 +1339,7 @@ export default function App() {
     const attendancePromise = db.get('attendance');
     const settingsPromise = db.get('settings');
     const targetsPromise = db.get('targets');
+    const businessTypesPromise = db.get('businessTypes');
 
     // Layar login cuma butuh data 'users', jadi begitu itu selesai,
     // langsung tampilkan layar login tanpa menunggu data lainnya.
@@ -1243,8 +1376,12 @@ export default function App() {
     targetsPromise.then((loadedTargets) => {
       setTargets(loadedTargets || []);
     });
+    businessTypesPromise.then((loadedTypes) => {
+      const names = (loadedTypes || []).map((t: any) => t.name).filter(Boolean);
+      setBusinessTypes(names.length > 0 ? names : defaultBusinessTypes);
+    });
 
-    Promise.allSettled([usersPromise, visitsPromise, attendancePromise, settingsPromise, targetsPromise]).then(() => setSyncing(false));
+    Promise.allSettled([usersPromise, visitsPromise, attendancePromise, settingsPromise, targetsPromise, businessTypesPromise]).then(() => setSyncing(false));
   }, []);
 
   const syncToDB = async (collection: string, data: any) => {
@@ -1290,6 +1427,11 @@ export default function App() {
   const handleUpdateTargets = (newTargets: Target[]) => {
     setTargets(newTargets);
     syncToDB('targets', newTargets);
+  };
+
+  const handleUpdateBusinessTypes = (newTypes: string[]) => {
+    setBusinessTypes(newTypes);
+    syncToDB('businessTypes', newTypes.map(name => ({ name })));
   };
 
   const addAuditLog = (action: string, detail: string) => {
@@ -1357,6 +1499,17 @@ export default function App() {
     setVisits(updatedVisits);
     appendToDB('visits', updatedVisits, newVisit);
     setCurrentTab('home');
+  };
+
+  // Pegawai bisa melengkapi/mengubah foto & nomor HP kunjungan yang sudah
+  // tersimpan, lewat menu Riwayat.
+  const handleEditVisit = (visitId: string, updates: { phone?: string, photo?: string }) => {
+    const existing = visits.find(v => v.id === visitId);
+    if (!existing) return;
+    const merged = { ...existing, ...updates };
+    const updatedVisits = visits.map(v => v.id === visitId ? merged : v);
+    setVisits(updatedVisits);
+    upsertToDB('visits', updatedVisits, merged);
   };
 
   const todayStr = new Date().toISOString().split('T')[0];
@@ -1502,7 +1655,7 @@ export default function App() {
             {adminTab === 'reports' && <AdminReports visits={visits} users={users} />}
           </Suspense>
           {adminTab === 'attendance' && <AdminAttendance attendance={attendance} users={users} attendanceSettings={attendanceSettings} onUpdateSettings={handleUpdateAttendanceSettings} />}
-          {adminTab === 'employees' && <AdminEmployees users={users} setUsers={handleUsersUpdate} addAuditLog={addAuditLog} targets={targets} onUpdateTargets={handleUpdateTargets} />}
+          {adminTab === 'employees' && <AdminEmployees users={users} setUsers={handleUsersUpdate} addAuditLog={addAuditLog} targets={targets} onUpdateTargets={handleUpdateTargets} businessTypes={businessTypes} onUpdateBusinessTypes={handleUpdateBusinessTypes} />}
         </main>
 
         {/* Menu mobile - sebelumnya menu ini tidak ada sama sekali di layar kecil/PWA */}
@@ -1572,33 +1725,9 @@ export default function App() {
               targets={targets}
             />
           )}
-          {currentTab === 'canvassing' && <CanvassingForm user={user} onSubmit={handleAddVisit} />}
+          {currentTab === 'canvassing' && <CanvassingForm user={user} onSubmit={handleAddVisit} businessTypes={businessTypes} />}
           {currentTab === 'history' && (
-            <div className="p-4 pb-24 space-y-4">
-              <h2 className="text-xl font-bold text-slate-800 mb-4">Riwayat Kunjungan Saya</h2>
-              {visits.filter(v => v.pegawaiId === user.id).map(v => (
-                <Card key={v.id} className="p-4 flex flex-col gap-2 border-l-4 border-l-blue-500">
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <h4 className="font-bold text-slate-800 flex items-center gap-1">
-                        {v.shopName} {v.isNewCustomer && <span className="bg-yellow-100 text-yellow-700 text-[10px] px-2 py-0.5 rounded-full ml-1 font-bold">Baru</span>}
-                      </h4>
-                      <p className="text-xs text-slate-500 flex items-center gap-1 mt-1"><MapPin size={12} /> {v.businessType}</p>
-                    </div>
-                    <span className={`text-[10px] px-2 py-1 rounded-full font-bold uppercase ${v.status === 'Closing' ? 'bg-emerald-100 text-emerald-700' : v.status === 'Prospek' ? 'bg-blue-100 text-blue-700' : 'bg-slate-100 text-slate-600'}`}>
-                      {v.status}
-                    </span>
-                  </div>
-                  <div className="text-xs text-slate-400 mt-2 border-t pt-2 flex justify-between">
-                    <span>{v.date} &bull; {v.time}</span>
-                    {v.nextFollowUp && <span className="text-yellow-600 font-medium">Follow Up: {v.nextFollowUp}</span>}
-                  </div>
-                </Card>
-              ))}
-              {visits.filter(v => v.pegawaiId === user.id).length === 0 && (
-                <p className="text-sm text-slate-400 text-center py-8">Belum ada riwayat kunjungan.</p>
-              )}
-            </div>
+            <PegawaiHistory user={user} visits={visits} onEditVisit={handleEditVisit} />
           )}
         </main>
 
