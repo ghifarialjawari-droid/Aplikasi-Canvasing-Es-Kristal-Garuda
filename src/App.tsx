@@ -21,7 +21,7 @@ const AdminReports = lazy(() => import('./admin/AdminReports'));
 // ==========================================
 // Ganti string kosong di bawah dengan URL Web App Google Apps Script Anda saat siap integrasi.
 // Selama kosong, aplikasi berjalan di mode Sandbox (menggunakan LocalStorage)
-const GAS_API_URL = "https://script.google.com/macros/s/AKfycbw1WM795b0RuqMkb81m4GxBYsImwrfn9zwJYCq_scJp7e1rhIoZTZAkybXSwWiz9W7a/exec";
+const GAS_API_URL = "";
 
 // Kunci sederhana supaya endpoint Google Apps Script tidak bisa diakses
 // sembarang orang yang kebetulan menemukan URL-nya. Ganti ke teks bebas
@@ -267,6 +267,31 @@ const db = {
         return { ok: true };
       } catch (err) {
         console.error(`API Error (upsert "${collection}"):`, err);
+        return { ok: false, error: String(err) };
+      }
+    } else {
+      localStorage.setItem(`esgaruda_${collection}`, JSON.stringify(fullArrayForCache));
+      return { ok: true };
+    }
+  },
+  // Menghapus SATU catatan berdasarkan id, tanpa mengirim ulang seluruh data.
+  async remove(collection: string, fullArrayForCache: any[], id: string): Promise<{ ok: boolean, error?: string }> {
+    localStorage.setItem(`esgaruda_cache_${collection}`, JSON.stringify(fullArrayForCache));
+
+    if (GAS_API_URL) {
+      try {
+        const res = await fetchWithRetry(GAS_API_URL, {
+          method: 'POST',
+          body: JSON.stringify({ action: 'delete', collection, id, key: GAS_API_KEY }),
+        });
+        const json = await res.json().catch(() => null);
+        if (json && json.error) {
+          console.error(`API Error (delete "${collection}"):`, json.error);
+          return { ok: false, error: json.error };
+        }
+        return { ok: true };
+      } catch (err) {
+        console.error(`API Error (delete "${collection}"):`, err);
         return { ok: false, error: String(err) };
       }
     } else {
@@ -715,7 +740,7 @@ const CanvassingForm = ({ user, onSubmit, businessTypes }: { user: User, onSubmi
               </div>
             ) : (
               <div className="border-2 border-dashed border-slate-300 bg-slate-50 rounded-xl p-6 text-center cursor-pointer hover:bg-slate-100 transition-colors relative">
-                <input type="file" accept="image/*" capture="environment" onChange={handlePhotoChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
+                <input type="file" accept="image/*" onChange={handlePhotoChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
                 <Camera size={32} className="mx-auto text-slate-400 mb-2" />
                 <span className="text-sm font-medium text-slate-600">Buka Kamera / Upload</span>
               </div>
@@ -1184,21 +1209,30 @@ const AdminEmployees = ({ users, setUsers, addAuditLog, targets, onUpdateTargets
 }
 
 const PegawaiHistory = ({
-  user, visits, onEditVisit
+  user, visits, businessTypes, onEditVisit, onDeleteVisit
 }: {
-  user: User, visits: Visit[], onEditVisit: (visitId: string, updates: { phone?: string, photo?: string }) => void
+  user: User, visits: Visit[], businessTypes: string[],
+  onEditVisit: (visitId: string, updates: Partial<Visit>) => void,
+  onDeleteVisit: (visitId: string) => void
 }) => {
   const [editingVisit, setEditingVisit] = useState<Visit | null>(null);
-  const [editPhone, setEditPhone] = useState('');
+  const [editForm, setEditForm] = useState({ shopName: '', phone: '', businessType: '', status: 'Prospek', isNewCustomer: false });
   const [editPhoto, setEditPhoto] = useState<string | null>(null);
   const [compressing, setCompressing] = useState(false);
   const [photoError, setPhotoError] = useState('');
 
   const myVisits = visits.filter(v => v.pegawaiId === user.id);
+  const statuses = ['Prospek', 'Closing'];
 
   const openEdit = (v: Visit) => {
     setEditingVisit(v);
-    setEditPhone(v.phone || '');
+    setEditForm({
+      shopName: v.shopName,
+      phone: v.phone || '',
+      businessType: v.businessType,
+      status: v.status,
+      isNewCustomer: v.isNewCustomer,
+    });
     setEditPhoto(v.photo || null);
     setPhotoError('');
   };
@@ -1216,8 +1250,22 @@ const PegawaiHistory = ({
 
   const handleSaveEdit = () => {
     if (!editingVisit) return;
-    onEditVisit(editingVisit.id, { phone: editPhone.trim(), photo: editPhoto || '' });
+    if (!editForm.shopName.trim()) { alert('Nama toko wajib diisi.'); return; }
+    onEditVisit(editingVisit.id, {
+      shopName: editForm.shopName.trim(),
+      phone: editForm.phone.trim(),
+      businessType: editForm.businessType,
+      status: editForm.status,
+      isNewCustomer: editForm.isNewCustomer,
+      photo: editPhoto || '',
+    });
     setEditingVisit(null);
+  };
+
+  const handleDelete = (v: Visit) => {
+    if (confirm(`Hapus data kunjungan "${v.shopName}"? Tindakan ini tidak bisa dibatalkan.`)) {
+      onDeleteVisit(v.id);
+    }
   };
 
   return (
@@ -1239,9 +1287,14 @@ const PegawaiHistory = ({
           </div>
           <div className="flex items-center justify-between mt-2 border-t pt-2">
             <span className="text-xs text-slate-400">{v.date} &bull; {v.time}</span>
-            <button onClick={() => openEdit(v)} className="text-xs font-semibold text-blue-600 flex items-center gap-1 hover:text-blue-700">
-              <Edit size={12} /> {v.photo ? 'Edit Foto/No HP' : 'Lengkapi Foto/No HP'}
-            </button>
+            <div className="flex items-center gap-3">
+              <button onClick={() => openEdit(v)} className="text-xs font-semibold text-blue-600 flex items-center gap-1 hover:text-blue-700">
+                <Edit size={12} /> Edit
+              </button>
+              <button onClick={() => handleDelete(v)} className="text-xs font-semibold text-red-500 flex items-center gap-1 hover:text-red-600">
+                <Trash2 size={12} /> Hapus
+              </button>
+            </div>
           </div>
         </Card>
       ))}
@@ -1250,14 +1303,22 @@ const PegawaiHistory = ({
       )}
 
       {editingVisit && (
-        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <Card className="w-full max-w-sm p-6">
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-4 overflow-y-auto">
+          <Card className="w-full max-w-sm p-6 my-8">
             <div className="flex justify-between items-center mb-4">
-              <h3 className="font-bold text-slate-800">{editingVisit.shopName}</h3>
+              <h3 className="font-bold text-slate-800">Edit Kunjungan</h3>
               <button onClick={() => setEditingVisit(null)} className="p-1 text-slate-400 hover:text-red-500"><X size={18} /></button>
             </div>
 
-            <Input label="Nomor WhatsApp/HP" type="tel" value={editPhone} onChange={(e: any) => setEditPhone(e.target.value)} placeholder="08..." />
+            <div className="flex items-center gap-3 mb-4 p-3 bg-blue-50 border border-blue-100 rounded-xl">
+              <input type="checkbox" id="editIsNew" checked={editForm.isNewCustomer} onChange={(e) => setEditForm({ ...editForm, isNewCustomer: e.target.checked })} className="w-5 h-5 text-blue-600 rounded" />
+              <label htmlFor="editIsNew" className="font-semibold text-blue-800 text-sm">Toko Baru (Pelanggan Baru)</label>
+            </div>
+
+            <Input label="Nama Toko/Usaha" required value={editForm.shopName} onChange={(e: any) => setEditForm({ ...editForm, shopName: e.target.value })} />
+            <Input label="Nomor WhatsApp/HP" type="tel" value={editForm.phone} onChange={(e: any) => setEditForm({ ...editForm, phone: e.target.value })} placeholder="08..." />
+            <Select label="Jenis Usaha" options={businessTypes} value={editForm.businessType} onChange={(e: any) => setEditForm({ ...editForm, businessType: e.target.value })} />
+            <Select label="Status Kunjungan" options={statuses} value={editForm.status} onChange={(e: any) => setEditForm({ ...editForm, status: e.target.value })} />
 
             <div className="mb-2">
               <label className="block text-sm font-medium text-slate-600 mb-1.5">Foto Depan Toko</label>
@@ -1275,9 +1336,9 @@ const PegawaiHistory = ({
                 </div>
               ) : (
                 <div className="border-2 border-dashed border-slate-300 bg-slate-50 rounded-xl p-6 text-center cursor-pointer hover:bg-slate-100 transition-colors relative">
-                  <input type="file" accept="image/*" capture="environment" onChange={handleEditPhotoChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
+                  <input type="file" accept="image/*" onChange={handleEditPhotoChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
                   <Camera size={28} className="mx-auto text-slate-400 mb-2" />
-                  <span className="text-sm font-medium text-slate-600">Buka Kamera / Upload</span>
+                  <span className="text-sm font-medium text-slate-600">Ambil Foto / Pilih dari Galeri</span>
                 </div>
               )}
               {photoError && <p className="text-red-500 text-xs mt-1">{photoError}</p>}
@@ -1414,6 +1475,16 @@ export default function App() {
     }
   };
 
+  const deleteFromDB = async (collection: string, fullArray: any[], id: string) => {
+    setSyncing(true);
+    const result = await db.remove(collection, fullArray, id);
+    setSyncing(false);
+    if (!result.ok) {
+      setSyncError(`Gagal menghapus data "${collection}" di server. Perubahan tersimpan sementara di HP ini.`);
+      setTimeout(() => setSyncError(null), 7000);
+    }
+  };
+
   const handleUsersUpdate = (newUsers: User[]) => {
     setUsers(newUsers);
     syncToDB('users', newUsers);
@@ -1501,15 +1572,21 @@ export default function App() {
     setCurrentTab('home');
   };
 
-  // Pegawai bisa melengkapi/mengubah foto & nomor HP kunjungan yang sudah
-  // tersimpan, lewat menu Riwayat.
-  const handleEditVisit = (visitId: string, updates: { phone?: string, photo?: string }) => {
+  // Pegawai bisa mengubah data kunjungan yang sudah tersimpan (termasuk
+  // status, jenis usaha, foto, no HP) lewat menu Riwayat.
+  const handleEditVisit = (visitId: string, updates: Partial<Visit>) => {
     const existing = visits.find(v => v.id === visitId);
     if (!existing) return;
     const merged = { ...existing, ...updates };
     const updatedVisits = visits.map(v => v.id === visitId ? merged : v);
     setVisits(updatedVisits);
     upsertToDB('visits', updatedVisits, merged);
+  };
+
+  const handleDeleteVisit = (visitId: string) => {
+    const updatedVisits = visits.filter(v => v.id !== visitId);
+    setVisits(updatedVisits);
+    deleteFromDB('visits', updatedVisits, visitId);
   };
 
   const todayStr = new Date().toISOString().split('T')[0];
@@ -1727,7 +1804,7 @@ export default function App() {
           )}
           {currentTab === 'canvassing' && <CanvassingForm user={user} onSubmit={handleAddVisit} businessTypes={businessTypes} />}
           {currentTab === 'history' && (
-            <PegawaiHistory user={user} visits={visits} onEditVisit={handleEditVisit} />
+            <PegawaiHistory user={user} visits={visits} businessTypes={businessTypes} onEditVisit={handleEditVisit} onDeleteVisit={handleDeleteVisit} />
           )}
         </main>
 
