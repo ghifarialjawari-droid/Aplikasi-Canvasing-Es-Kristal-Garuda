@@ -1355,6 +1355,39 @@ const PegawaiHistory = ({
   );
 };
 
+const AdminCanvasing = ({
+  user, businessTypes, visits, onAddVisit, onEditVisit, onDeleteVisit
+}: {
+  user: User, businessTypes: string[], visits: Visit[],
+  onAddVisit: (v: Visit) => void,
+  onEditVisit: (visitId: string, updates: Partial<Visit>) => void,
+  onDeleteVisit: (visitId: string) => void
+}) => {
+  const [innerTab, setInnerTab] = useState<'baru' | 'riwayat'>('baru');
+
+  return (
+    <div className="p-6 md:p-8 bg-slate-50 min-h-screen">
+      <div className="mb-4">
+        <h1 className="text-2xl md:text-3xl font-bold text-slate-800">Canvasing</h1>
+        <p className="text-slate-500">Admin juga bisa input kunjungan canvasing langsung dari sini.</p>
+      </div>
+
+      <div className="flex gap-2 bg-slate-100 p-1 rounded-xl w-fit mb-6">
+        <button onClick={() => setInnerTab('baru')} className={`px-4 py-2 rounded-lg text-sm font-semibold ${innerTab === 'baru' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500'}`}>Input Baru</button>
+        <button onClick={() => setInnerTab('riwayat')} className={`px-4 py-2 rounded-lg text-sm font-semibold ${innerTab === 'riwayat' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500'}`}>Riwayat Saya</button>
+      </div>
+
+      <div className="max-w-lg mx-auto md:mx-0">
+        {innerTab === 'baru' ? (
+          <CanvassingForm user={user} onSubmit={onAddVisit} businessTypes={businessTypes} />
+        ) : (
+          <PegawaiHistory user={user} visits={visits} businessTypes={businessTypes} onEditVisit={onEditVisit} onDeleteVisit={onDeleteVisit} />
+        )}
+      </div>
+    </div>
+  );
+};
+
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [users, setUsers] = useState<User[]>([]);
@@ -1364,7 +1397,7 @@ export default function App() {
   const [businessTypes, setBusinessTypes] = useState<string[]>(defaultBusinessTypes);
   const [attendanceSettings, setAttendanceSettings] = useState<AttendanceSettings>(defaultAttendanceSettings);
   const [currentTab, setCurrentTab] = useState<'home' | 'canvassing' | 'history'>('home');
-  const [adminTab, setAdminTab] = useState<'dashboard' | 'map' | 'employees' | 'attendance' | 'targets' | 'reports'>('dashboard');
+  const [adminTab, setAdminTab] = useState<'dashboard' | 'map' | 'employees' | 'attendance' | 'targets' | 'reports' | 'canvasing'>('dashboard');
   const [auditLogs, setAuditLogs] = useState<any[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [initialized, setInitialized] = useState(false);
@@ -1704,6 +1737,7 @@ export default function App() {
           </div>
           <nav className="p-4 flex-1 hidden md:flex flex-col gap-2">
             <button onClick={() => setAdminTab('dashboard')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'dashboard' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><BarChart3 size={20} /> Dashboard Kunjungan</button>
+            <button onClick={() => setAdminTab('canvasing')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'canvasing' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><PlusCircle size={20} /> Canvasing</button>
             <button onClick={() => setAdminTab('map')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'map' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><Map size={20} /> Peta Wilayah GPS</button>
             <button onClick={() => setAdminTab('attendance')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'attendance' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><Clock size={20} /> Absensi Karyawan</button>
             <button onClick={() => setAdminTab('targets')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'targets' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><TargetIcon size={20} /> Target Canvasing</button>
@@ -1733,6 +1767,7 @@ export default function App() {
           </Suspense>
           {adminTab === 'attendance' && <AdminAttendance attendance={attendance} users={users} attendanceSettings={attendanceSettings} onUpdateSettings={handleUpdateAttendanceSettings} />}
           {adminTab === 'employees' && <AdminEmployees users={users} setUsers={handleUsersUpdate} addAuditLog={addAuditLog} targets={targets} onUpdateTargets={handleUpdateTargets} businessTypes={businessTypes} onUpdateBusinessTypes={handleUpdateBusinessTypes} />}
+          {adminTab === 'canvasing' && <AdminCanvasing user={user} businessTypes={businessTypes} visits={visits} onAddVisit={handleAddVisit} onEditVisit={handleEditVisit} onDeleteVisit={handleDeleteVisit} />}
         </main>
 
         {/* Menu mobile - sebelumnya menu ini tidak ada sama sekali di layar kecil/PWA */}
@@ -1740,6 +1775,10 @@ export default function App() {
           <button onClick={() => setAdminTab('dashboard')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 transition-colors ${adminTab === 'dashboard' ? 'text-blue-600' : 'text-slate-400'}`}>
             <BarChart3 size={20} />
             <span className="text-[9px] font-medium">Dashboard</span>
+          </button>
+          <button onClick={() => setAdminTab('canvasing')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 transition-colors ${adminTab === 'canvasing' ? 'text-blue-600' : 'text-slate-400'}`}>
+            <PlusCircle size={20} />
+            <span className="text-[9px] font-medium">Canvasing</span>
           </button>
           <button onClick={() => setAdminTab('map')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 transition-colors ${adminTab === 'map' ? 'text-blue-600' : 'text-slate-400'}`}>
             <Map size={20} />
