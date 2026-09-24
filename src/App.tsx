@@ -1760,7 +1760,7 @@ export default function App() {
 
         <main className="flex-1 overflow-y-auto pb-20 md:pb-0">
           <Suspense fallback={<AdminSectionLoading />}>
-            {adminTab === 'dashboard' && <AdminDashboard visits={visits} users={users} attendance={attendance} targets={targets} />}
+            {adminTab === 'dashboard' && <AdminDashboard visits={visits} users={users} attendance={attendance} />}
             {adminTab === 'map' && <AdminMap visits={visits} users={users} />}
             {adminTab === 'targets' && <AdminTargets visits={visits} users={users} targets={targets} onUpdateTargets={handleUpdateTargets} />}
             {adminTab === 'reports' && <AdminReports visits={visits} users={users} />}
