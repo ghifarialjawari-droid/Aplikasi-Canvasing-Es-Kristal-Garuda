@@ -88,8 +88,11 @@ const getStatusColorClasses = (status: string) => {
   }
 };
 
-const AdminMap = ({ visits, users }: { visits: Visit[], users: User[] }) => {
-  const [filterCabang, setFilterCabang] = useState('Semua');
+// restrictCabang: kalau diisi (dipakai akun pegawai), peta dikunci hanya menampilkan
+// kunjungan di depot/cabang itu dan filter cabang disembunyikan.
+const AdminMap = ({ visits, users, restrictCabang }: { visits: Visit[], users: User[], restrictCabang?: string }) => {
+  const [filterCabangRaw, setFilterCabang] = useState('Semua');
+  const filterCabang = restrictCabang ?? filterCabangRaw;
   const [filterPegawai, setFilterPegawai] = useState('Semua');
   const [filterStatus, setFilterStatus] = useState('Semua');
   const [selectedMarker, setSelectedMarker] = useState<Visit | null>(null);
@@ -105,7 +108,9 @@ const AdminMap = ({ visits, users }: { visits: Visit[], users: User[] }) => {
 
   const filteredVisits = visits.filter(v => {
     const peg = users.find(u => u.id === v.pegawaiId);
-    if (filterCabang !== 'Semua' && peg?.cabang !== filterCabang) return false;
+    if (restrictCabang) {
+      if (v.cabang !== restrictCabang) return false;
+    } else if (filterCabang !== 'Semua' && peg?.cabang !== filterCabang) return false;
     if (filterPegawai !== 'Semua' && peg?.name !== filterPegawai) return false;
     if (filterStatus !== 'Semua' && v.status !== filterStatus) return false;
     return v.lat !== null && v.lng !== null;
@@ -153,31 +158,37 @@ const AdminMap = ({ visits, users }: { visits: Visit[], users: User[] }) => {
       map.fitBounds(bounds, { padding: [40, 40], maxZoom: 15 });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visits, filterCabang, filterPegawai, filterStatus]);
+  }, [visits, filterCabang, filterPegawai, filterStatus, restrictCabang]);
 
   const openInGoogleMaps = (lat: number, lng: number) => {
     window.open(`https://www.google.com/maps?q=${lat},${lng}`, '_blank', 'noopener,noreferrer');
   };
 
   return (
-    <div className="p-6 md:p-8 space-y-6 bg-slate-50 min-h-screen">
+    <div className={`${restrictCabang ? 'p-4 pb-24 space-y-4' : 'p-6 md:p-8 space-y-6'} bg-slate-50 min-h-screen`}>
       <div>
-        <h1 className="text-2xl md:text-3xl font-bold text-slate-800">Peta Sebaran Canvasing</h1>
-        <p className="text-slate-500">Tracking GPS real-time dari aktivitas lapangan pegawai.</p>
+        <h1 className={`${restrictCabang ? 'text-xl' : 'text-2xl md:text-3xl'} font-bold text-slate-800`}>
+          {restrictCabang ? `Peta Canvasing Depot ${restrictCabang}` : 'Peta Sebaran Canvasing'}
+        </h1>
+        <p className="text-slate-500 text-sm">
+          {restrictCabang ? 'Titik kunjungan canvasing seluruh tim di depot Anda.' : 'Tracking GPS real-time dari aktivitas lapangan pegawai.'}
+        </p>
       </div>
 
       <Card className="p-5">
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-          <Select label="Filter Cabang" value={filterCabang} onChange={(e: any) => { setFilterCabang(e.target.value); setFilterPegawai('Semua'); }} options={cabangList} />
+        <div className={`grid grid-cols-1 ${restrictCabang ? 'md:grid-cols-3' : 'md:grid-cols-4'} gap-4`}>
+          {!restrictCabang && (
+            <Select label="Filter Cabang" value={filterCabang} onChange={(e: any) => { setFilterCabang(e.target.value); setFilterPegawai('Semua'); }} options={cabangList} />
+          )}
           <Select label="Filter Pegawai" value={filterPegawai} onChange={(e: any) => setFilterPegawai(e.target.value)} options={pegawaiList} />
           <Select label="Status Kunjungan" value={filterStatus} onChange={(e: any) => setFilterStatus(e.target.value)} options={statusList} />
           <div className="flex items-end pb-4">
-            <Button variant="outline" className="w-full" onClick={() => { setFilterCabang('Semua'); setFilterPegawai('Semua'); setFilterStatus('Semua'); }}>Reset Filter</Button>
+            <Button variant="outline" className="w-full" onClick={() => { if (!restrictCabang) setFilterCabang('Semua'); setFilterPegawai('Semua'); setFilterStatus('Semua'); }}>Reset Filter</Button>
           </div>
         </div>
       </Card>
 
-      <Card className="p-0 overflow-hidden relative h-[600px]">
+      <Card className="p-0 overflow-hidden relative h-[65vh] min-h-[400px] md:h-[600px]">
         <div ref={mapDivRef} className="w-full h-full z-0" />
 
         <div className="absolute top-4 left-4 z-[400] bg-white/90 p-4 rounded-xl shadow-md border border-white backdrop-blur text-sm font-medium space-y-2 pointer-events-none">
@@ -186,7 +197,7 @@ const AdminMap = ({ visits, users }: { visits: Visit[], users: User[] }) => {
         </div>
 
         {selectedMarker && (
-          <div className="absolute top-4 right-4 w-80 bg-white rounded-2xl shadow-2xl border border-slate-200 z-[500] p-4 animate-in fade-in slide-in-from-right-8">
+          <div className="absolute top-4 right-4 left-4 sm:left-auto sm:w-80 max-h-[90%] overflow-y-auto bg-white rounded-2xl shadow-2xl border border-slate-200 z-[500] p-4 animate-in fade-in slide-in-from-right-8">
             <div className="flex justify-between items-start mb-4">
               <div>
                 <h3 className="font-bold text-slate-800 text-lg">{selectedMarker.shopName}</h3>

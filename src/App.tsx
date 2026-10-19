@@ -1535,7 +1535,7 @@ export default function App() {
   const [targets, setTargets] = useState<Target[]>([]);
   const [businessTypes, setBusinessTypes] = useState<string[]>(defaultBusinessTypes);
   const [attendanceSettings, setAttendanceSettings] = useState<AttendanceSettings>(defaultAttendanceSettings);
-  const [currentTab, setCurrentTab] = useState<'home' | 'canvassing' | 'history' | 'customers'>('home');
+  const [currentTab, setCurrentTab] = useState<'home' | 'canvassing' | 'history' | 'customers' | 'map'>('home');
   const [adminTab, setAdminTab] = useState<'dashboard' | 'map' | 'employees' | 'attendance' | 'reports' | 'canvasing' | 'customers'>('dashboard');
   const [auditLogs, setAuditLogs] = useState<any[]>([]);
   const [syncing, setSyncing] = useState(false);
@@ -1987,6 +1987,11 @@ export default function App() {
           {currentTab === 'customers' && (
             <CustomerDatabase visits={visits.filter(v => v.pegawaiId === user.id)} users={users} isAdmin={false} />
           )}
+          {currentTab === 'map' && (
+            <Suspense fallback={<AdminSectionLoading />}>
+              <AdminMap visits={visits} users={users} restrictCabang={user.cabang} />
+            </Suspense>
+          )}
         </main>
 
         <nav className="fixed bottom-0 w-full max-w-md bg-white border-t border-slate-200 flex items-center p-2 pb-safe z-20">
@@ -2015,6 +2020,13 @@ export default function App() {
           </button>
 
           <div className="flex-1 flex justify-around">
+            <button
+              onClick={() => setCurrentTab('map')}
+              className={`flex flex-col items-center gap-1 p-2 w-16 transition-colors ${currentTab === 'map' ? 'text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}
+            >
+              <Map size={24} className={currentTab === 'map' ? 'fill-blue-100' : ''} />
+              <span className="text-[10px] font-medium">Peta</span>
+            </button>
             <button
               onClick={() => setCurrentTab('customers')}
               className={`flex flex-col items-center gap-1 p-2 w-16 transition-colors ${currentTab === 'customers' ? 'text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}
