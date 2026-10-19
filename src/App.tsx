@@ -4,7 +4,7 @@ import {
   BarChart3, Home, PlusCircle, History, TrendingUp,
   Map, UserPlus, FileText, AlertCircle,
   Edit, Trash2, Key, Shield, Info, X, Power, PowerOff, RefreshCw, Store,
-  Clock, ExternalLink, Download, Image as ImageIcon, LogIn, WifiOff, Target as TargetIcon
+  Clock, ExternalLink, Download, Image as ImageIcon, LogIn, WifiOff, Target as TargetIcon, Database, Search, Phone
 } from 'lucide-react';
 
 // AdminDashboard (pakai recharts) dan AdminMap (pakai leaflet) sengaja
@@ -1356,34 +1356,173 @@ const PegawaiHistory = ({
 };
 
 const AdminCanvasing = ({
-  user, businessTypes, visits, onAddVisit, onEditVisit, onDeleteVisit
+  user, users, businessTypes, visits, targets, onAddVisit, onEditVisit, onDeleteVisit, onUpdateTargets
 }: {
-  user: User, businessTypes: string[], visits: Visit[],
+  user: User, users: User[], businessTypes: string[], visits: Visit[], targets: Target[],
   onAddVisit: (v: Visit) => void,
   onEditVisit: (visitId: string, updates: Partial<Visit>) => void,
-  onDeleteVisit: (visitId: string) => void
+  onDeleteVisit: (visitId: string) => void,
+  onUpdateTargets: (t: Target[]) => void
 }) => {
-  const [innerTab, setInnerTab] = useState<'baru' | 'riwayat'>('baru');
+  const [innerTab, setInnerTab] = useState<'baru' | 'riwayat' | 'pengaturan'>('baru');
+
+  const tabClass = (t: string) =>
+    `px-4 py-2 rounded-lg text-sm font-semibold whitespace-nowrap ${innerTab === t ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500'}`;
 
   return (
     <div className="p-6 md:p-8 bg-slate-50 min-h-screen">
       <div className="mb-4">
         <h1 className="text-2xl md:text-3xl font-bold text-slate-800">Canvasing</h1>
-        <p className="text-slate-500">Admin juga bisa input kunjungan canvasing langsung dari sini.</p>
+        <p className="text-slate-500">Input kunjungan canvasing dan atur target canvasing.</p>
       </div>
 
-      <div className="flex gap-2 bg-slate-100 p-1 rounded-xl w-fit mb-6">
-        <button onClick={() => setInnerTab('baru')} className={`px-4 py-2 rounded-lg text-sm font-semibold ${innerTab === 'baru' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500'}`}>Input Baru</button>
-        <button onClick={() => setInnerTab('riwayat')} className={`px-4 py-2 rounded-lg text-sm font-semibold ${innerTab === 'riwayat' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500'}`}>Riwayat Saya</button>
+      <div className="flex gap-2 bg-slate-100 p-1 rounded-xl w-fit max-w-full overflow-x-auto mb-6">
+        <button onClick={() => setInnerTab('baru')} className={tabClass('baru')}>Input Baru</button>
+        <button onClick={() => setInnerTab('riwayat')} className={tabClass('riwayat')}>Riwayat Saya</button>
+        <button onClick={() => setInnerTab('pengaturan')} className={tabClass('pengaturan')}>Pengaturan Target</button>
       </div>
 
-      <div className="max-w-lg mx-auto md:mx-0">
-        {innerTab === 'baru' ? (
-          <CanvassingForm user={user} onSubmit={onAddVisit} businessTypes={businessTypes} />
-        ) : (
-          <PegawaiHistory user={user} visits={visits} businessTypes={businessTypes} onEditVisit={onEditVisit} onDeleteVisit={onDeleteVisit} />
+      {innerTab === 'pengaturan' ? (
+        <Suspense fallback={<AdminSectionLoading />}>
+          <AdminTargets visits={visits} users={users} targets={targets} onUpdateTargets={onUpdateTargets} />
+        </Suspense>
+      ) : (
+        <div className="max-w-lg mx-auto md:mx-0">
+          {innerTab === 'baru' ? (
+            <CanvassingForm user={user} onSubmit={onAddVisit} businessTypes={businessTypes} />
+          ) : (
+            <PegawaiHistory user={user} visits={visits} businessTypes={businessTypes} onEditVisit={onEditVisit} onDeleteVisit={onDeleteVisit} />
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Database Customer: daftar toko/pelanggan unik yang dirangkum dari data
+// kunjungan canvasing. Satu toko = satu baris; info terbaru yang tersedia
+// (no telp, foto, titik GPS) diambil dari kunjungan terbaru yang punya datanya.
+const CustomerDatabase = ({
+  visits, users, isAdmin
+}: {
+  visits: Visit[], users: User[], isAdmin: boolean
+}) => {
+  const [filterCabang, setFilterCabang] = useState('Semua');
+  const [search, setSearch] = useState('');
+  const [photoView, setPhotoView] = useState<{ url: string, name: string } | null>(null);
+
+  const cabangList = ['Semua', ...Array.from(new Set(users.filter(u => u.role === 'pegawai').map(u => u.cabang)))];
+
+  // Urutkan dari kunjungan terbaru ke terlama, lalu gabungkan per nama toko.
+  const sorted = [...visits].sort((a, b) => ((a.date + ' ' + a.time) < (b.date + ' ' + b.time) ? 1 : -1));
+  const grouped: Record<string, { shopName: string, cabang: string, phone: string, photo: string, lat: number | null, lng: number | null, lastDate: string }> = {};
+  sorted.forEach((v) => {
+    const key = (v.shopName || '').trim().toLowerCase();
+    if (!key) return;
+    const g = grouped[key];
+    if (!g) {
+      grouped[key] = {
+        shopName: v.shopName.trim(), cabang: v.cabang, phone: v.phone || '', photo: v.photo || '',
+        lat: v.lat ?? null, lng: v.lng ?? null, lastDate: v.date,
+      };
+    } else {
+      if (!g.phone && v.phone) g.phone = v.phone;
+      if (!g.photo && v.photo) g.photo = v.photo;
+      if ((g.lat === null || g.lng === null) && v.lat !== null && v.lat !== undefined && v.lng !== null && v.lng !== undefined) {
+        g.lat = v.lat; g.lng = v.lng;
+      }
+    }
+  });
+
+  let customers = Object.values(grouped);
+  if (isAdmin && filterCabang !== 'Semua') customers = customers.filter(c => c.cabang === filterCabang);
+  if (search.trim()) customers = customers.filter(c => c.shopName.toLowerCase().includes(search.trim().toLowerCase()));
+  customers.sort((a, b) => a.shopName.localeCompare(b.shopName));
+
+  const openMaps = (lat: number | null, lng: number | null) => {
+    if (lat === null || lng === null) return;
+    window.open(`https://www.google.com/maps?q=${lat},${lng}`, '_blank', 'noopener,noreferrer');
+  };
+
+  return (
+    <div className={isAdmin ? 'p-6 md:p-8 space-y-6 bg-slate-50 min-h-screen' : 'p-4 pb-24 space-y-4'}>
+      <div>
+        <h1 className={isAdmin ? 'text-2xl md:text-3xl font-bold text-slate-800' : 'text-xl font-bold text-slate-800'}>Data Customer</h1>
+        <p className="text-slate-500 text-sm">{customers.length} toko tercatat{isAdmin ? '' : ' dari kunjungan Anda'}.</p>
+      </div>
+
+      <div className={`flex gap-3 ${isAdmin ? 'flex-col sm:flex-row' : 'flex-col'}`}>
+        <div className="relative flex-1">
+          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+          <input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Cari nama toko..."
+            className="w-full bg-white border border-slate-200 text-slate-800 rounded-xl pl-9 pr-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-sm"
+          />
+        </div>
+        {isAdmin && (
+          <select
+            value={filterCabang}
+            onChange={(e) => setFilterCabang(e.target.value)}
+            className="bg-white border border-slate-200 text-slate-800 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-sm font-medium"
+          >
+            {cabangList.map(c => <option key={c} value={c}>Depot: {c}</option>)}
+          </select>
         )}
       </div>
+
+      <div className={isAdmin ? 'grid grid-cols-1 lg:grid-cols-2 gap-3' : 'space-y-3'}>
+        {customers.map((c) => (
+          <Card key={c.shopName.toLowerCase()} className="p-4 flex items-center gap-3">
+            {c.photo ? (
+              <button onClick={() => setPhotoView({ url: c.photo, name: c.shopName })} className="flex-shrink-0">
+                <img src={c.photo} alt={c.shopName} className="w-16 h-16 object-cover rounded-xl border border-slate-200" />
+              </button>
+            ) : (
+              <div className="w-16 h-16 flex-shrink-0 rounded-xl bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-300">
+                <Camera size={22} />
+              </div>
+            )}
+            <div className="flex-1 min-w-0">
+              <h4 className="font-bold text-slate-800 truncate">{c.shopName}</h4>
+              {isAdmin && <p className="text-xs text-slate-500 truncate">{c.cabang}</p>}
+              {c.phone ? (
+                <a href={`tel:${c.phone}`} className="text-sm text-blue-600 flex items-center gap-1 mt-0.5"><Phone size={12} /> {c.phone}</a>
+              ) : (
+                <p className="text-xs text-slate-400 mt-0.5">No telp belum diisi</p>
+              )}
+            </div>
+            <div className="flex flex-col gap-1.5 flex-shrink-0">
+              {c.lat !== null && c.lng !== null ? (
+                <button onClick={() => openMaps(c.lat, c.lng)} className="px-2.5 py-1.5 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 text-xs font-semibold flex items-center gap-1">
+                  <MapPin size={12} /> Lokasi
+                </button>
+              ) : (
+                <span className="text-xs text-slate-300 px-2.5 py-1.5">Tanpa GPS</span>
+              )}
+            </div>
+          </Card>
+        ))}
+        {customers.length === 0 && (
+          <Card className="p-8 text-center text-slate-400 col-span-full">
+            <Database size={28} className="mx-auto mb-2 text-slate-300" />
+            {search.trim() ? 'Tidak ada toko yang cocok dengan pencarian.' : 'Belum ada data customer. Data otomatis muncul dari kunjungan canvasing.'}
+          </Card>
+        )}
+      </div>
+
+      {photoView && (
+        <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-sm z-[600] flex items-center justify-center p-4" onClick={() => setPhotoView(null)}>
+          <div className="max-w-lg w-full" onClick={(e) => e.stopPropagation()}>
+            <div className="flex justify-between items-center mb-2">
+              <span className="text-white font-semibold text-sm truncate">{photoView.name}</span>
+              <button onClick={() => setPhotoView(null)} className="p-2 bg-white rounded-full shadow hover:bg-slate-100"><X size={18} /></button>
+            </div>
+            <img src={photoView.url} alt={photoView.name} className="w-full rounded-2xl shadow-2xl" />
+          </div>
+        </div>
+      )}
     </div>
   );
 };
@@ -1396,8 +1535,8 @@ export default function App() {
   const [targets, setTargets] = useState<Target[]>([]);
   const [businessTypes, setBusinessTypes] = useState<string[]>(defaultBusinessTypes);
   const [attendanceSettings, setAttendanceSettings] = useState<AttendanceSettings>(defaultAttendanceSettings);
-  const [currentTab, setCurrentTab] = useState<'home' | 'canvassing' | 'history'>('home');
-  const [adminTab, setAdminTab] = useState<'dashboard' | 'map' | 'employees' | 'attendance' | 'targets' | 'reports' | 'canvasing'>('dashboard');
+  const [currentTab, setCurrentTab] = useState<'home' | 'canvassing' | 'history' | 'customers'>('home');
+  const [adminTab, setAdminTab] = useState<'dashboard' | 'map' | 'employees' | 'attendance' | 'reports' | 'canvasing' | 'customers'>('dashboard');
   const [auditLogs, setAuditLogs] = useState<any[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [initialized, setInitialized] = useState(false);
@@ -1739,8 +1878,8 @@ export default function App() {
             <button onClick={() => setAdminTab('dashboard')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'dashboard' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><BarChart3 size={20} /> Dashboard Kunjungan</button>
             <button onClick={() => setAdminTab('canvasing')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'canvasing' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><PlusCircle size={20} /> Canvasing</button>
             <button onClick={() => setAdminTab('map')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'map' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><Map size={20} /> Peta Wilayah GPS</button>
+            <button onClick={() => setAdminTab('customers')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'customers' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><Database size={20} /> Data Customer</button>
             <button onClick={() => setAdminTab('attendance')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'attendance' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><Clock size={20} /> Absensi Karyawan</button>
-            <button onClick={() => setAdminTab('targets')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'targets' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><TargetIcon size={20} /> Target Canvasing</button>
             <button onClick={() => setAdminTab('reports')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'reports' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><FileText size={20} /> Laporan Bulanan</button>
             <button onClick={() => setAdminTab('employees')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'employees' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><Users size={20} /> Kelola Akun Pegawai</button>
           </nav>
@@ -1762,41 +1901,41 @@ export default function App() {
           <Suspense fallback={<AdminSectionLoading />}>
             {adminTab === 'dashboard' && <AdminDashboard visits={visits} users={users} attendance={attendance} />}
             {adminTab === 'map' && <AdminMap visits={visits} users={users} />}
-            {adminTab === 'targets' && <AdminTargets visits={visits} users={users} targets={targets} onUpdateTargets={handleUpdateTargets} />}
             {adminTab === 'reports' && <AdminReports visits={visits} users={users} />}
           </Suspense>
           {adminTab === 'attendance' && <AdminAttendance attendance={attendance} users={users} attendanceSettings={attendanceSettings} onUpdateSettings={handleUpdateAttendanceSettings} />}
           {adminTab === 'employees' && <AdminEmployees users={users} setUsers={handleUsersUpdate} addAuditLog={addAuditLog} targets={targets} onUpdateTargets={handleUpdateTargets} businessTypes={businessTypes} onUpdateBusinessTypes={handleUpdateBusinessTypes} />}
-          {adminTab === 'canvasing' && <AdminCanvasing user={user} businessTypes={businessTypes} visits={visits} onAddVisit={handleAddVisit} onEditVisit={handleEditVisit} onDeleteVisit={handleDeleteVisit} />}
+          {adminTab === 'customers' && <CustomerDatabase visits={visits} users={users} isAdmin={true} />}
+          {adminTab === 'canvasing' && <AdminCanvasing user={user} users={users} businessTypes={businessTypes} visits={visits} targets={targets} onAddVisit={handleAddVisit} onEditVisit={handleEditVisit} onDeleteVisit={handleDeleteVisit} onUpdateTargets={handleUpdateTargets} />}
         </main>
 
         {/* Menu mobile - sebelumnya menu ini tidak ada sama sekali di layar kecil/PWA */}
         <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 flex justify-around p-1.5 pb-safe z-20 overflow-x-auto">
-          <button onClick={() => setAdminTab('dashboard')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 transition-colors ${adminTab === 'dashboard' ? 'text-blue-600' : 'text-slate-400'}`}>
+          <button onClick={() => setAdminTab('dashboard')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 min-w-[48px] transition-colors ${adminTab === 'dashboard' ? 'text-blue-600' : 'text-slate-400'}`}>
             <BarChart3 size={20} />
             <span className="text-[9px] font-medium">Dashboard</span>
           </button>
-          <button onClick={() => setAdminTab('canvasing')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 transition-colors ${adminTab === 'canvasing' ? 'text-blue-600' : 'text-slate-400'}`}>
+          <button onClick={() => setAdminTab('canvasing')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 min-w-[48px] transition-colors ${adminTab === 'canvasing' ? 'text-blue-600' : 'text-slate-400'}`}>
             <PlusCircle size={20} />
             <span className="text-[9px] font-medium">Canvasing</span>
           </button>
-          <button onClick={() => setAdminTab('map')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 transition-colors ${adminTab === 'map' ? 'text-blue-600' : 'text-slate-400'}`}>
+          <button onClick={() => setAdminTab('map')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 min-w-[48px] transition-colors ${adminTab === 'map' ? 'text-blue-600' : 'text-slate-400'}`}>
             <Map size={20} />
             <span className="text-[9px] font-medium">Peta</span>
           </button>
-          <button onClick={() => setAdminTab('attendance')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 transition-colors ${adminTab === 'attendance' ? 'text-blue-600' : 'text-slate-400'}`}>
+          <button onClick={() => setAdminTab('customers')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 min-w-[48px] transition-colors ${adminTab === 'customers' ? 'text-blue-600' : 'text-slate-400'}`}>
+            <Database size={20} />
+            <span className="text-[9px] font-medium">Customer</span>
+          </button>
+          <button onClick={() => setAdminTab('attendance')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 min-w-[48px] transition-colors ${adminTab === 'attendance' ? 'text-blue-600' : 'text-slate-400'}`}>
             <Clock size={20} />
             <span className="text-[9px] font-medium">Absensi</span>
           </button>
-          <button onClick={() => setAdminTab('targets')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 transition-colors ${adminTab === 'targets' ? 'text-blue-600' : 'text-slate-400'}`}>
-            <TargetIcon size={20} />
-            <span className="text-[9px] font-medium">Target</span>
-          </button>
-          <button onClick={() => setAdminTab('reports')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 transition-colors ${adminTab === 'reports' ? 'text-blue-600' : 'text-slate-400'}`}>
+          <button onClick={() => setAdminTab('reports')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 min-w-[48px] transition-colors ${adminTab === 'reports' ? 'text-blue-600' : 'text-slate-400'}`}>
             <FileText size={20} />
             <span className="text-[9px] font-medium">Laporan</span>
           </button>
-          <button onClick={() => setAdminTab('employees')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 transition-colors ${adminTab === 'employees' ? 'text-blue-600' : 'text-slate-400'}`}>
+          <button onClick={() => setAdminTab('employees')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 min-w-[48px] transition-colors ${adminTab === 'employees' ? 'text-blue-600' : 'text-slate-400'}`}>
             <Users size={20} />
             <span className="text-[9px] font-medium">Pegawai</span>
           </button>
@@ -1845,31 +1984,45 @@ export default function App() {
           {currentTab === 'history' && (
             <PegawaiHistory user={user} visits={visits} businessTypes={businessTypes} onEditVisit={handleEditVisit} onDeleteVisit={handleDeleteVisit} />
           )}
+          {currentTab === 'customers' && (
+            <CustomerDatabase visits={visits.filter(v => v.pegawaiId === user.id)} users={users} isAdmin={false} />
+          )}
         </main>
 
-        <nav className="fixed bottom-0 w-full max-w-md bg-white border-t border-slate-200 flex justify-around p-2 pb-safe z-20">
-          <button
-            onClick={() => setCurrentTab('home')}
-            className={`flex flex-col items-center gap-1 p-2 w-20 transition-colors ${currentTab === 'home' ? 'text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}
-          >
-            <Home size={24} className={currentTab === 'home' ? 'fill-blue-100' : ''} />
-            <span className="text-[10px] font-medium">Dashboard</span>
-          </button>
+        <nav className="fixed bottom-0 w-full max-w-md bg-white border-t border-slate-200 flex items-center p-2 pb-safe z-20">
+          <div className="flex-1 flex justify-around">
+            <button
+              onClick={() => setCurrentTab('home')}
+              className={`flex flex-col items-center gap-1 p-2 w-16 transition-colors ${currentTab === 'home' ? 'text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}
+            >
+              <Home size={24} className={currentTab === 'home' ? 'fill-blue-100' : ''} />
+              <span className="text-[10px] font-medium">Dashboard</span>
+            </button>
+            <button
+              onClick={() => setCurrentTab('history')}
+              className={`flex flex-col items-center gap-1 p-2 w-16 transition-colors ${currentTab === 'history' ? 'text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}
+            >
+              <History size={24} className={currentTab === 'history' ? 'fill-blue-100' : ''} />
+              <span className="text-[10px] font-medium">Riwayat</span>
+            </button>
+          </div>
 
           <button
             onClick={() => setCurrentTab('canvassing')}
-            className="relative -top-6 flex flex-col items-center justify-center w-16 h-16 bg-blue-600 text-white rounded-full shadow-lg shadow-blue-300 border-4 border-slate-50 hover:bg-blue-700 transition-transform active:scale-95"
+            className="relative -top-6 flex flex-col items-center justify-center w-16 h-16 flex-shrink-0 bg-blue-600 text-white rounded-full shadow-lg shadow-blue-300 border-4 border-slate-50 hover:bg-blue-700 transition-transform active:scale-95"
           >
             <PlusCircle size={32} />
           </button>
 
-          <button
-            onClick={() => setCurrentTab('history')}
-            className={`flex flex-col items-center gap-1 p-2 w-20 transition-colors ${currentTab === 'history' ? 'text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}
-          >
-            <History size={24} className={currentTab === 'history' ? 'fill-blue-100' : ''} />
-            <span className="text-[10px] font-medium">Riwayat</span>
-          </button>
+          <div className="flex-1 flex justify-around">
+            <button
+              onClick={() => setCurrentTab('customers')}
+              className={`flex flex-col items-center gap-1 p-2 w-16 transition-colors ${currentTab === 'customers' ? 'text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}
+            >
+              <Database size={24} className={currentTab === 'customers' ? 'fill-blue-100' : ''} />
+              <span className="text-[10px] font-medium">Customer</span>
+            </button>
+          </div>
         </nav>
       </div>
     </div>
