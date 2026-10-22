@@ -7,6 +7,9 @@ import {
   Clock, ExternalLink, Download, Image as ImageIcon, LogIn, WifiOff, Target as TargetIcon, Database, Search, Phone
 } from 'lucide-react';
 
+import { localDateStr, localMonthStr, formatHHmm, normalizeTimeStr } from './lib/dates';
+import { getTargetForMonth, buildTargetHistory } from './lib/targets';
+
 // AdminDashboard (pakai recharts) dan AdminMap (pakai leaflet) sengaja
 // dimuat "lazy" - hanya di-download saat Admin benar-benar membuka halaman
 // itu. Pegawai (yang jumlahnya lebih banyak & sering buka dari HP) jadi
@@ -97,6 +100,34 @@ const defaultAttendanceSettings: AttendanceSettings = {
   isActive: true,
 };
 
+// Merapikan pengaturan absensi dari sumber mana pun (server/cache/form) supaya
+// jam selalu "HH:mm" yang valid. Nilai yang rusak diganti nilai bawaan, jadi
+// aplikasi tidak pernah salah hitung jendela absen akibat data aneh.
+function sanitizeAttendanceSettings(raw: any): AttendanceSettings {
+  const d = defaultAttendanceSettings;
+  const r = raw || {};
+  let days: string[] = d.activeDays;
+  if (Array.isArray(r.activeDays)) days = r.activeDays.map((x: any) => String(x).trim()).filter(Boolean);
+  else if (typeof r.activeDays === 'string') days = r.activeDays.split(',').map((x: string) => x.trim()).filter(Boolean);
+  const tol = Number(r.toleranceMinutes);
+  return {
+    checkInStart: normalizeTimeStr(r.checkInStart) || d.checkInStart,
+    checkInEnd: normalizeTimeStr(r.checkInEnd) || d.checkInEnd,
+    checkOutStart: normalizeTimeStr(r.checkOutStart) || d.checkOutStart,
+    checkOutEnd: normalizeTimeStr(r.checkOutEnd) || d.checkOutEnd,
+    toleranceMinutes: isFinite(tol) && r.toleranceMinutes !== '' && r.toleranceMinutes !== null && r.toleranceMinutes !== undefined ? Math.max(0, tol) : d.toleranceMinutes,
+    activeDays: days,
+    isActive: r.isActive === undefined ? d.isActive : (r.isActive === true || r.isActive === 'TRUE' || r.isActive === 'true'),
+  };
+}
+
+function settingsEqual(a: AttendanceSettings, b: AttendanceSettings): boolean {
+  return a.checkInStart === b.checkInStart && a.checkInEnd === b.checkInEnd &&
+    a.checkOutStart === b.checkOutStart && a.checkOutEnd === b.checkOutEnd &&
+    a.toleranceMinutes === b.toleranceMinutes && a.isActive === b.isActive &&
+    a.activeDays.join('|') === b.activeDays.join('|');
+}
+
 const DAY_NAMES_ID = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
 
 // Sesi login otomatis kedaluwarsa setelah durasi ini (jam) demi keamanan -
@@ -114,10 +145,8 @@ function timeToMinutes(t: string): number {
 // cadangan. Ini menyatukan dua sistem target supaya selalu konsisten di
 // mana pun ditampilkan (Kelola Pegawai, Dashboard Pegawai, dsb).
 function getEffectiveTarget(u: User, targets: Target[]): { visits: number, newCustomers: number } {
-  const thisMonthStr = new Date().toISOString().slice(0, 7);
-  const match = targets.find(t => t.period === 'bulanan' && t.scope === 'pegawai' && t.scopeId === u.id && t.startDate.slice(0, 7) === thisMonthStr);
-  if (match) return { visits: match.visitTarget, newCustomers: match.newCustomerTarget };
-  return { visits: u.target?.visits || 0, newCustomers: u.target?.newCustomers || 0 };
+  const t = getTargetForMonth(u, targets, localMonthStr());
+  return { visits: t.visits, newCustomers: t.newCustomers };
 }
 
 // Target Canvasing - dibuat Admin, bisa untuk 1 pegawai atau seluruh cabang/depot
@@ -298,8 +327,52 @@ const db = {
       localStorage.setItem(`esgaruda_${collection}`, JSON.stringify(fullArrayForCache));
       return { ok: true };
     }
+  },
+  // Mengambil data SEGAR langsung dari server (tanpa cadangan lokal), dipakai
+  // untuk memastikan penyimpanan benar-benar sampai & untuk penyegaran
+  // berkala. Beberapa koleksi diambil dalam satu permintaan (getMany); kalau
+  // Code.gs di server masih versi lama, otomatis diambil satu per satu.
+  async fetchFresh(collections: string[]): Promise<{ ok: boolean, data: Record<string, any[]>, error?: string }> {
+    if (!GAS_API_URL) {
+      const data: Record<string, any[]> = {};
+      collections.forEach((c) => {
+        try { data[c] = JSON.parse(localStorage.getItem(`esgaruda_${c}`) || '[]'); } catch { data[c] = []; }
+      });
+      return { ok: true, data };
+    }
+    const keyQ = `&key=${encodeURIComponent(GAS_API_KEY)}`;
+    try {
+      const res = await fetchWithRetry(`${GAS_API_URL}?action=getMany&collections=${collections.join(',')}${keyQ}`);
+      const json = await res.json();
+      if (json && !json.error && !Array.isArray(json)) return { ok: true, data: json };
+    } catch (err) {
+      return { ok: false, data: {}, error: String(err) };
+    }
+    try {
+      const data: Record<string, any[]> = {};
+      for (const c of collections) {
+        const res = await fetchWithRetry(`${GAS_API_URL}?action=get&collection=${c}${keyQ}`);
+        const json = await res.json();
+        if (!Array.isArray(json)) return { ok: false, data: {}, error: (json && json.error) || 'Respons server tidak valid' };
+        data[c] = json;
+      }
+      return { ok: true, data };
+    } catch (err) {
+      return { ok: false, data: {}, error: String(err) };
+    }
   }
 };
+
+// Hasil menyimpan pengaturan, ditampilkan ke Admin
+type SaveStatus = { status: 'ok' | 'warn' | 'error', message: string };
+
+function targetsEqual(a: Target[], b: Target[]): boolean {
+  if (a.length !== b.length) return false;
+  const key = (t: Target) => [t.id, t.scope, t.scopeId, t.period, t.startDate, t.visitTarget, t.newCustomerTarget].join('|');
+  const ka = a.map(key).sort();
+  const kb = b.map(key).sort();
+  return ka.every((k, i) => k === kb[i]);
+}
 
 // Logo motor kurir - dipakai di layar login, sidebar admin, dan header pegawai
 const LogoIcon = ({ size = 24, className = '' }: { size?: number, className?: string }) => (
@@ -429,7 +502,7 @@ const PegawaiDashboard = ({
   onCheckIn: () => void, onCheckOut: () => void, attendanceLoading: boolean, attendanceSettings: AttendanceSettings, targets: Target[]
 }) => {
   const myVisits = visits.filter(v => v.pegawaiId === user.id);
-  const todayDate = new Date().toISOString().split('T')[0];
+  const todayDate = localDateStr();
   const thisMonthStr = todayDate.slice(0, 7);
   const visitsToday = myVisits.filter(v => v.date === todayDate).length;
   const newCustomers = myVisits.filter(v => v.isNewCustomer).length;
@@ -439,14 +512,14 @@ const PegawaiDashboard = ({
   const realisasiVisits = monthlyVisits.length;
   const realisasiNew = monthlyVisits.filter(v => v.isNewCustomer).length;
 
-  // Utamakan target dari menu "Target Canvasing" (Admin) kalau ada yang berlaku
-  // bulan ini untuk pegawai ini atau cabangnya; kalau tidak ada, pakai target
-  // bawaan akun (User.target) sebagai cadangan.
-  const myTarget = targets.find(t => t.period === 'bulanan' && t.scope === 'pegawai' && t.scopeId === user.id && t.startDate.slice(0, 7) === thisMonthStr)
-    || targets.find(t => t.period === 'bulanan' && t.scope === 'cabang' && t.scopeId === user.cabang && t.startDate.slice(0, 7) === thisMonthStr);
+  // Target bulan ini dari menu "Target Canvasing" (Admin). Kalau Admin belum
+  // memperbarui target bulan ini, target terakhir tetap berlaku.
+  const currentTarget = getTargetForMonth(user, targets, thisMonthStr);
+  const targetVisits = currentTarget.visits;
+  const targetNew = currentTarget.newCustomers;
 
-  const targetVisits = myTarget ? myTarget.visitTarget : (user.target.visits || 0);
-  const targetNew = myTarget ? myTarget.newCustomerTarget : (user.target.newCustomers || 0);
+  // Riwayat pencapaian bulan-bulan sebelumnya
+  const targetHistory = buildTargetHistory(user, myVisits, targets);
 
   const progressVisits = targetVisits > 0 ? Math.min(100, Math.round((realisasiVisits / targetVisits) * 100)) : 0;
   const progressNew = targetNew > 0 ? Math.min(100, Math.round((realisasiNew / targetNew) * 100)) : 0;
@@ -504,6 +577,34 @@ const PegawaiDashboard = ({
           </div>
         </div>
       </div>
+
+      {targetHistory.length > 0 && (
+        <Card className="p-4">
+          <h3 className="font-bold text-slate-800 mb-3 flex items-center gap-2"><History size={18} className="text-blue-600" /> Riwayat Target Bulan Sebelumnya</h3>
+          {!targetHistory[0].achieved && (
+            <div className="flex items-start gap-2 text-xs font-medium text-red-700 bg-red-50 border border-red-100 p-3 rounded-xl mb-3">
+              <AlertCircle size={16} className="flex-shrink-0 mt-0.5" />
+              <span>Bulan lalu ({targetHistory[0].label}) target tidak tercapai. Ayo kejar target bulan ini!</span>
+            </div>
+          )}
+          <div className="space-y-2">
+            {targetHistory.map((h) => (
+              <div key={h.month} className={`p-3 rounded-xl border ${h.achieved ? 'bg-emerald-50 border-emerald-100' : 'bg-red-50 border-red-100'}`}>
+                <div className="flex justify-between items-center gap-2 mb-1.5">
+                  <span className="font-semibold text-slate-800 text-sm">{h.label}</span>
+                  <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold uppercase ${h.achieved ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
+                    {h.achieved ? 'Tercapai' : 'Tidak mencapai target'}
+                  </span>
+                </div>
+                <div className="flex justify-between gap-2 text-xs text-slate-600">
+                  <span>Kunjungan: <b>{h.realVisits}/{h.targetVisits}</b> ({h.pctVisits}%)</span>
+                  <span>Toko baru: <b>{h.realNew}/{h.targetNew}</b> ({h.pctNew}%)</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
 
       <Card className="p-4">
         <h3 className="font-bold text-slate-800 mb-3 flex items-center gap-2"><Clock size={18} className="text-blue-600" /> Absensi Hari Ini</h3>
@@ -661,8 +762,8 @@ const CanvassingForm = ({ user, onSubmit, businessTypes }: { user: User, onSubmi
     setSubmitting(true);
     const newVisit: Visit = {
       id: Date.now().toString(),
-      date: new Date().toISOString().split('T')[0],
-      time: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
+      date: localDateStr(),
+      time: formatHHmm(),
       shopName: formData.shopName.trim(),
       owner: '',
       phone: formData.phone.trim(),
@@ -764,9 +865,14 @@ const CanvassingForm = ({ user, onSubmit, businessTypes }: { user: User, onSubmi
 
 const ALL_DAY_NAMES = ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu', 'Minggu'];
 
-const AttendanceScheduleForm = ({ settings, onSave }: { settings: AttendanceSettings, onSave: (s: AttendanceSettings) => void }) => {
+const AttendanceScheduleForm = ({ settings, onSave }: { settings: AttendanceSettings, onSave: (s: AttendanceSettings) => Promise<SaveStatus> | void }) => {
   const [form, setForm] = useState<AttendanceSettings>(settings);
-  const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [result, setResult] = useState<SaveStatus | null>(null);
+
+  // Ikuti pengaturan terbaru dari server (mis. dimuat setelah form terbuka,
+  // atau diubah Admin lain). Hanya berubah kalau isinya memang berbeda.
+  useEffect(() => { setForm(settings); }, [settings]);
 
   const toggleDay = (day: string) => {
     setForm((prev) => ({
@@ -777,11 +883,26 @@ const AttendanceScheduleForm = ({ settings, onSave }: { settings: AttendanceSett
     }));
   };
 
-  const handleSave = (e: React.FormEvent) => {
+  const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    onSave(form);
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2500);
+    if (saving) return;
+    if (timeToMinutes(form.checkInEnd) < timeToMinutes(form.checkInStart)) {
+      setResult({ status: 'error', message: 'Batas akhir jam masuk tidak boleh lebih awal dari jam masuk.' });
+      return;
+    }
+    if (timeToMinutes(form.checkOutEnd) < timeToMinutes(form.checkOutStart)) {
+      setResult({ status: 'error', message: 'Batas akhir jam pulang tidak boleh lebih awal dari jam pulang.' });
+      return;
+    }
+    if (form.isActive && form.activeDays.length === 0) {
+      setResult({ status: 'error', message: 'Pilih minimal satu hari kerja aktif.' });
+      return;
+    }
+    setSaving(true);
+    setResult(null);
+    const res = await onSave(form);
+    setSaving(false);
+    setResult(res || { status: 'ok', message: 'Tersimpan.' });
   };
 
   return (
@@ -828,7 +949,12 @@ const AttendanceScheduleForm = ({ settings, onSave }: { settings: AttendanceSett
         </div>
       </Card>
 
-      <Button type="submit" variant="primary">{saved ? 'Tersimpan ✓' : 'Simpan Pengaturan Jadwal'}</Button>
+      <Button type="submit" variant="primary" disabled={saving}>{saving ? 'Menyimpan & memeriksa ke server...' : 'Simpan Pengaturan Jadwal'}</Button>
+      {result && (
+        <div className={`p-3 rounded-xl text-sm font-medium border ${result.status === 'ok' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : result.status === 'warn' ? 'bg-amber-50 text-amber-800 border-amber-200' : 'bg-red-50 text-red-700 border-red-200'}`}>
+          {result.status === 'ok' ? '✓ ' : '⚠ '}{result.message}
+        </div>
+      )}
     </form>
   );
 };
@@ -836,9 +962,9 @@ const AttendanceScheduleForm = ({ settings, onSave }: { settings: AttendanceSett
 const AdminAttendance = ({
   attendance, users, attendanceSettings, onUpdateSettings
 }: {
-  attendance: Attendance[], users: User[], attendanceSettings: AttendanceSettings, onUpdateSettings: (s: AttendanceSettings) => void
+  attendance: Attendance[], users: User[], attendanceSettings: AttendanceSettings, onUpdateSettings: (s: AttendanceSettings) => Promise<SaveStatus> | void
 }) => {
-  const todayStr = new Date().toISOString().split('T')[0];
+  const todayStr = localDateStr();
   const [innerTab, setInnerTab] = useState<'rekap' | 'jadwal'>('rekap');
   const [filterCabang, setFilterCabang] = useState('Semua');
   const [filterDate, setFilterDate] = useState(todayStr);
@@ -1012,7 +1138,7 @@ const AdminEmployees = ({ users, setUsers, addAuditLog, targets, onUpdateTargets
         : u));
 
       // Samakan dengan Target Canvasing bulan ini: perbarui kalau sudah ada, buat baru kalau belum.
-      const thisMonthStr = new Date().toISOString().slice(0, 7);
+      const thisMonthStr = localMonthStr();
       const existingTarget = targets.find(t => t.period === 'bulanan' && t.scope === 'pegawai' && t.scopeId === selectedUser.id && t.startDate.slice(0, 7) === thisMonthStr);
       if (existingTarget) {
         onUpdateTargets(targets.map(t => t.id === existingTarget.id ? { ...t, visitTarget, newCustomerTarget, scopeLabel: cleanName } : t));
@@ -1023,7 +1149,7 @@ const AdminEmployees = ({ users, setUsers, addAuditLog, targets, onUpdateTargets
           scopeId: cleanId,
           scopeLabel: cleanName,
           period: 'bulanan',
-          startDate: new Date().toISOString().split('T')[0],
+          startDate: localDateStr(),
           visitTarget,
           newCustomerTarget,
         };
@@ -1543,6 +1669,20 @@ export default function App() {
   const [attendanceLoading, setAttendanceLoading] = useState(false);
   const [isOnline, setIsOnline] = useState(true);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ type: 'success' | 'warning', text: string } | null>(null);
+
+  // Pelacak penyimpanan lokal, supaya penyegaran otomatis dari server tidak
+  // menimpa perubahan yang baru saja dibuat dan masih dalam proses dikirim.
+  const pendingWritesRef = useRef(0);
+  const lastLocalWriteRef = useRef(0);
+  const refreshingRef = useRef(false);
+  const lastRefreshRef = useRef(0);
+  const refreshConfigRef = useRef<(force?: boolean) => void>(() => {});
+
+  const showNotice = (type: 'success' | 'warning', text: string) => {
+    setNotice({ type, text });
+    setTimeout(() => setNotice(null), type === 'success' ? 4000 : 9000);
+  };
 
   // Pantau status koneksi supaya bisa tampil peringatan "Sedang Offline"
   // dan otomatis menyegarkan data begitu koneksi kembali (reconnect otomatis).
@@ -1552,6 +1692,7 @@ export default function App() {
       setIsOnline(true);
       db.get('visits').then((v) => setVisits(v.length > 0 ? v : defaultVisits));
       db.get('attendance').then((a) => setAttendance(a || []));
+      refreshConfigRef.current(true);
     };
     const goOffline = () => setIsOnline(false);
     window.addEventListener('online', goOnline);
@@ -1604,7 +1745,7 @@ export default function App() {
       setAttendance(loadedAttendance || []);
     });
     settingsPromise.then((loadedSettings) => {
-      setAttendanceSettings(loadedSettings && loadedSettings.length > 0 ? loadedSettings[0] : defaultAttendanceSettings);
+      setAttendanceSettings(loadedSettings && loadedSettings.length > 0 ? sanitizeAttendanceSettings(loadedSettings[0]) : defaultAttendanceSettings);
     });
     targetsPromise.then((loadedTargets) => {
       setTargets(loadedTargets || []);
@@ -1617,59 +1758,122 @@ export default function App() {
     Promise.allSettled([usersPromise, visitsPromise, attendancePromise, settingsPromise, targetsPromise, businessTypesPromise]).then(() => setSyncing(false));
   }, []);
 
-  const syncToDB = async (collection: string, data: any) => {
+  // Membungkus setiap penyimpanan ke server supaya penyegaran otomatis tahu
+  // kapan ada perubahan lokal yang sedang dikirim.
+  const trackWrite = async <T,>(fn: () => Promise<T>): Promise<T> => {
+    pendingWritesRef.current += 1;
+    lastLocalWriteRef.current = Date.now();
     setSyncing(true);
-    const result = await db.save(collection, data);
-    setSyncing(false);
-    if (!result.ok) {
-      setSyncError(`Gagal menyimpan "${collection}" ke server. Data tersimpan sementara di HP ini, coba sinkron ulang nanti.`);
-      setTimeout(() => setSyncError(null), 7000);
+    try {
+      return await fn();
+    } finally {
+      pendingWritesRef.current -= 1;
+      lastLocalWriteRef.current = Date.now();
+      setSyncing(false);
     }
+  };
+
+  const reportSaveFailure = (collection: string, verb = 'menyimpan') => {
+    setSyncError(`Gagal ${verb} "${collection}" ke server. Data tersimpan sementara di HP ini, coba sinkron ulang nanti.`);
+    setTimeout(() => setSyncError(null), 7000);
+  };
+
+  const syncToDB = async (collection: string, data: any) => {
+    const result = await trackWrite(() => db.save(collection, data));
+    if (!result.ok) reportSaveFailure(collection);
+    return result;
   };
 
   const appendToDB = async (collection: string, fullArray: any[], newItem: any) => {
-    setSyncing(true);
-    const result = await db.append(collection, fullArray, newItem);
-    setSyncing(false);
-    if (!result.ok) {
-      setSyncError(`Gagal menyimpan "${collection}" ke server. Data tersimpan sementara di HP ini, coba sinkron ulang nanti.`);
-      setTimeout(() => setSyncError(null), 7000);
-    }
+    const result = await trackWrite(() => db.append(collection, fullArray, newItem));
+    if (!result.ok) reportSaveFailure(collection);
+    return result;
   };
 
   const upsertToDB = async (collection: string, fullArray: any[], item: any) => {
-    setSyncing(true);
-    const result = await db.upsert(collection, fullArray, item);
-    setSyncing(false);
-    if (!result.ok) {
-      setSyncError(`Gagal menyimpan "${collection}" ke server. Data tersimpan sementara di HP ini, coba sinkron ulang nanti.`);
-      setTimeout(() => setSyncError(null), 7000);
-    }
+    const result = await trackWrite(() => db.upsert(collection, fullArray, item));
+    if (!result.ok) reportSaveFailure(collection);
+    return result;
   };
 
   const deleteFromDB = async (collection: string, fullArray: any[], id: string) => {
-    setSyncing(true);
-    const result = await db.remove(collection, fullArray, id);
-    setSyncing(false);
-    if (!result.ok) {
-      setSyncError(`Gagal menghapus data "${collection}" di server. Perubahan tersimpan sementara di HP ini.`);
-      setTimeout(() => setSyncError(null), 7000);
+    const result = await trackWrite(() => db.remove(collection, fullArray, id));
+    if (!result.ok) reportSaveFailure(collection, 'menghapus');
+    return result;
+  };
+
+  // Penyegaran otomatis pengaturan yang diatur Admin (jadwal absen, target,
+  // jenis usaha) supaya perubahan langsung berlaku di akun lain tanpa harus
+  // menutup-buka aplikasi.
+  const refreshConfig = async (force = false) => {
+    if (!GAS_API_URL) return; // mode lokal: tidak ada server bersama untuk disinkronkan
+    if (refreshingRef.current) return;
+    if (!force && Date.now() - lastRefreshRef.current < 20000) return;
+    refreshingRef.current = true;
+    const startedAt = Date.now();
+    const res = await db.fetchFresh(['settings', 'targets', 'businessTypes']);
+    refreshingRef.current = false;
+    lastRefreshRef.current = Date.now();
+    if (!res.ok) return;
+    // Jangan timpa kalau ada penyimpanan lokal yang sedang/baru berjalan
+    if (pendingWritesRef.current > 0 || lastLocalWriteRef.current >= startedAt) return;
+
+    const data = res.data;
+    if (data.settings && data.settings.length > 0) {
+      const next = sanitizeAttendanceSettings(data.settings[0]);
+      setAttendanceSettings((prev) => (settingsEqual(prev, next) ? prev : next));
+    }
+    if (Array.isArray(data.targets)) {
+      const next = data.targets as Target[];
+      setTargets((prev) => (targetsEqual(prev, next) ? prev : next));
+    }
+    if (Array.isArray(data.businessTypes)) {
+      const names = data.businessTypes.map((t: any) => t.name).filter(Boolean);
+      if (names.length > 0) setBusinessTypes((prev) => (prev.join('|') === names.join('|') ? prev : names));
     }
   };
+  refreshConfigRef.current = refreshConfig;
 
   const handleUsersUpdate = (newUsers: User[]) => {
     setUsers(newUsers);
     syncToDB('users', newUsers);
   };
 
-  const handleUpdateAttendanceSettings = (newSettings: AttendanceSettings) => {
-    setAttendanceSettings(newSettings);
-    syncToDB('settings', [newSettings]);
+  const handleUpdateAttendanceSettings = async (newSettings: AttendanceSettings): Promise<SaveStatus> => {
+    const clean = sanitizeAttendanceSettings(newSettings);
+    setAttendanceSettings(clean); // langsung aktif di akun ini
+    const result = await syncToDB('settings', [clean]);
+    if (!result.ok) {
+      return { status: 'error', message: 'Gagal menyimpan ke server. Pengaturan baru hanya aktif di perangkat ini. Periksa koneksi lalu simpan lagi.' };
+    }
+    // Pastikan benar-benar tersimpan: ambil ulang dari server & bandingkan
+    const fresh = await db.fetchFresh(['settings']);
+    if (!fresh.ok) {
+      return { status: 'warn', message: 'Terkirim, tetapi belum bisa dipastikan tersimpan di server (koneksi bermasalah). Coba buka ulang halaman ini untuk memeriksa.' };
+    }
+    const rows = fresh.data.settings || [];
+    if (rows.length === 0 || !settingsEqual(clean, sanitizeAttendanceSettings(rows[0]))) {
+      return { status: 'warn', message: 'Terkirim ke server, tetapi isi yang tersimpan di Google Sheets berbeda dari yang Anda isi. Pastikan Code.gs versi terbaru sudah di-deploy (Deploy > Manage deployments > New version).' };
+    }
+    showNotice('success', 'Pengaturan absensi tersimpan & langsung aktif.');
+    return { status: 'ok', message: 'Tersimpan di server dan langsung aktif. Akun lain menerimanya otomatis (paling lama sekitar 1 menit, atau seketika saat aplikasinya dibuka).' };
   };
 
-  const handleUpdateTargets = (newTargets: Target[]) => {
-    setTargets(newTargets);
-    syncToDB('targets', newTargets);
+  const handleUpdateTargets = async (newTargets: Target[]): Promise<SaveStatus> => {
+    setTargets(newTargets); // langsung aktif di akun ini
+    const result = await syncToDB('targets', newTargets);
+    if (!result.ok) {
+      return { status: 'error', message: 'Gagal menyimpan target ke server. Perubahan hanya aktif di perangkat ini. Periksa koneksi lalu coba lagi.' };
+    }
+    const fresh = await db.fetchFresh(['targets']);
+    if (!fresh.ok) {
+      return { status: 'warn', message: 'Target terkirim, tetapi belum bisa dipastikan tersimpan di server (koneksi bermasalah).' };
+    }
+    if (!targetsEqual(newTargets, (fresh.data.targets || []) as Target[])) {
+      return { status: 'warn', message: 'Target terkirim, tetapi isi yang tersimpan di Google Sheets berbeda. Pastikan Code.gs versi terbaru sudah di-deploy (Deploy > Manage deployments > New version).' };
+    }
+    showNotice('success', 'Target tersimpan & langsung aktif di semua akun.');
+    return { status: 'ok', message: 'Target tersimpan di server dan langsung aktif. Akun karyawan menerimanya otomatis (paling lama sekitar 1 menit, atau saat aplikasinya dibuka).' };
   };
 
   const handleUpdateBusinessTypes = (newTypes: string[]) => {
@@ -1761,7 +1965,7 @@ export default function App() {
     deleteFromDB('visits', updatedVisits, visitId);
   };
 
-  const todayStr = new Date().toISOString().split('T')[0];
+  const todayStr = localDateStr();
   const attendanceToday = user ? attendance.find(a => a.pegawaiId === user.id && a.date === todayStr) || null : null;
 
   const handleCheckIn = () => {
@@ -1792,7 +1996,7 @@ export default function App() {
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         const now = new Date();
-        const timeStr = now.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+        const timeStr = formatHHmm(now);
         let status: Attendance['status'] = 'Tepat Waktu';
         if (attendanceSettings.isActive) {
           const nowMinutes = now.getHours() * 60 + now.getMinutes();
@@ -1802,7 +2006,7 @@ export default function App() {
         const newAtt: Attendance = {
           id: Date.now().toString(),
           pegawaiId: user.id,
-          date: now.toISOString().split('T')[0],
+          date: localDateStr(now),
           checkInTime: timeStr,
           checkInLat: pos.coords.latitude,
           checkInLng: pos.coords.longitude,
@@ -1840,7 +2044,7 @@ export default function App() {
     setAttendanceLoading(true);
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        const timeStr = new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+        const timeStr = formatHHmm();
         const updatedRecord = { ...attendanceToday, checkOutTime: timeStr, checkOutLat: pos.coords.latitude, checkOutLng: pos.coords.longitude };
         const updated = attendance.map(a => a.id === attendanceToday.id ? updatedRecord : a);
         setAttendance(updated);
@@ -1851,6 +2055,26 @@ export default function App() {
       { enableHighAccuracy: true, timeout: 10000 }
     );
   };
+
+  // Setelah login: segarkan pengaturan dari server, lalu ulangi saat aplikasi
+  // kembali dibuka/difokuskan dan setiap 1 menit selama layar aktif. Dengan
+  // begitu perubahan jadwal absen/target dari Admin langsung berlaku di semua akun.
+  useEffect(() => {
+    if (!user) return;
+    refreshConfigRef.current(true);
+    const onVisible = () => { if (document.visibilityState === 'visible') refreshConfigRef.current(); };
+    const onFocus = () => refreshConfigRef.current();
+    const interval = setInterval(() => {
+      if (document.visibilityState === 'visible') refreshConfigRef.current(true);
+    }, 60000);
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onFocus);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [user?.id]);
 
   if (!initialized) return <div className="min-h-screen flex items-center justify-center bg-slate-50 font-bold text-slate-500">Memuat Sistem...</div>;
 
@@ -1864,6 +2088,11 @@ export default function App() {
         {syncError && (
           <div className="fixed bottom-20 md:bottom-4 left-1/2 -translate-x-1/2 z-[999] bg-red-600 text-white text-xs font-medium px-4 py-2 rounded-full shadow-lg max-w-[90%] text-center">
             {syncError}
+          </div>
+        )}
+        {notice && !syncError && (
+          <div className={`fixed bottom-20 md:bottom-4 left-1/2 -translate-x-1/2 z-[999] ${notice.type === 'success' ? 'bg-emerald-600' : 'bg-amber-500'} text-white text-xs font-medium px-4 py-2 rounded-full shadow-lg max-w-[90%] text-center`}>
+            {notice.text}
           </div>
         )}
         <aside className="bg-blue-700 text-white w-full md:w-64 flex-shrink-0 flex flex-col">
@@ -1901,7 +2130,7 @@ export default function App() {
           <Suspense fallback={<AdminSectionLoading />}>
             {adminTab === 'dashboard' && <AdminDashboard visits={visits} users={users} attendance={attendance} />}
             {adminTab === 'map' && <AdminMap visits={visits} users={users} />}
-            {adminTab === 'reports' && <AdminReports visits={visits} users={users} />}
+            {adminTab === 'reports' && <AdminReports visits={visits} users={users} targets={targets} />}
           </Suspense>
           {adminTab === 'attendance' && <AdminAttendance attendance={attendance} users={users} attendanceSettings={attendanceSettings} onUpdateSettings={handleUpdateAttendanceSettings} />}
           {adminTab === 'employees' && <AdminEmployees users={users} setUsers={handleUsersUpdate} addAuditLog={addAuditLog} targets={targets} onUpdateTargets={handleUpdateTargets} businessTypes={businessTypes} onUpdateBusinessTypes={handleUpdateBusinessTypes} />}

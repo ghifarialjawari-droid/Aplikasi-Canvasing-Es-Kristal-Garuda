@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Clock, AlertTriangle, MapPin, ExternalLink, CalendarDays } from 'lucide-react';
+import { localDateStr } from '../lib/dates';
 
 // Tipe data disalin dari App.tsx supaya file ini berdiri sendiri
 // (bisa di-lazy-load terpisah tanpa ikut menyeret komponen lain).
@@ -43,7 +44,7 @@ const AdminDashboard = ({
 }: {
   visits: Visit[], users: User[], attendance: Attendance[]
 }) => {
-  const todayStr = new Date().toISOString().split('T')[0];
+  const todayStr = localDateStr();
   const [canvasDate, setCanvasDate] = useState(todayStr);
   const isToday = canvasDate === todayStr;
 

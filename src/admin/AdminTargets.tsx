@@ -1,5 +1,9 @@
 import React, { useState } from 'react';
-import { Target as TargetIcon, PlusCircle, Trash2, Edit, X, TrendingUp } from 'lucide-react';
+import { Target as TargetIcon, PlusCircle, Trash2, Edit, X, TrendingUp, AlertCircle, CheckCircle, Copy } from 'lucide-react';
+import { localDateStr } from '../lib/dates';
+import { getTargetForMonth, monthLabel } from '../lib/targets';
+
+type SaveStatus = { status: 'ok' | 'warn' | 'error', message: string };
 
 // Tipe data disalin dari App.tsx supaya file ini berdiri sendiri
 // (bisa di-lazy-load terpisah tanpa ikut menyeret komponen lain).
@@ -96,13 +100,13 @@ function getDateRangeForTarget(t: Target): { start: string, end: string } {
     monday.setDate(start.getDate() + diffToMonday);
     const sunday = new Date(monday);
     sunday.setDate(monday.getDate() + 6);
-    return { start: monday.toISOString().split('T')[0], end: sunday.toISOString().split('T')[0] };
+    return { start: localDateStr(monday), end: localDateStr(sunday) };
   }
 
   // bulanan
   const firstDay = new Date(start.getFullYear(), start.getMonth(), 1);
   const lastDay = new Date(start.getFullYear(), start.getMonth() + 1, 0);
-  return { start: firstDay.toISOString().split('T')[0], end: lastDay.toISOString().split('T')[0] };
+  return { start: localDateStr(firstDay), end: localDateStr(lastDay) };
 }
 
 function computeRealisasi(t: Target, visits: Visit[], users: User[]) {
@@ -130,13 +134,14 @@ const periodLabel: Record<string, string> = { harian: 'Harian', mingguan: 'Mingg
 const AdminTargets = ({
   visits, users, targets, onUpdateTargets
 }: {
-  visits: Visit[], users: User[], targets: Target[], onUpdateTargets: (t: Target[]) => void
+  visits: Visit[], users: User[], targets: Target[], onUpdateTargets: (t: Target[]) => Promise<SaveStatus> | void
 }) => {
+  const [notice, setNotice] = useState<SaveStatus | null>(null);
   const [showModal, setShowModal] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [filterPeriod, setFilterPeriod] = useState('Semua');
 
-  const todayStr = new Date().toISOString().split('T')[0];
+  const todayStr = localDateStr();
   const pegawaiList = users.filter((u) => u.role === 'pegawai');
   const cabangList = Array.from(new Set(pegawaiList.map((u) => u.cabang)));
 
@@ -165,6 +170,12 @@ const AdminTargets = ({
     setShowModal(true);
   };
 
+  const persist = async (list: Target[]) => {
+    setNotice(null);
+    const res = await onUpdateTargets(list);
+    if (res) setNotice(res);
+  };
+
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
     if (!form.scopeId) { alert('Pilih pegawai atau cabang tujuan target.'); return; }
@@ -174,18 +185,38 @@ const AdminTargets = ({
       : form.scopeId;
 
     if (editingId) {
-      onUpdateTargets(targets.map((t) => t.id === editingId ? { ...t, ...form, scopeLabel } : t));
+      persist(targets.map((t) => t.id === editingId ? { ...t, ...form, scopeLabel } : t));
     } else {
       const newTarget: Target = { id: Date.now().toString(), ...form, scopeLabel };
-      onUpdateTargets([newTarget, ...targets]);
+      persist([newTarget, ...targets]);
     }
     setShowModal(false);
   };
 
   const handleDelete = (t: Target) => {
     if (confirm(`Hapus target untuk ${t.scopeLabel} (${periodLabel[t.period]})?`)) {
-      onUpdateTargets(targets.filter((x) => x.id !== t.id));
+      persist(targets.filter((x) => x.id !== t.id));
     }
+  };
+
+  // Target ditetapkan sebulan sekali. Cari pegawai yang belum punya target
+  // baru untuk bulan ini (sementara memakai target terakhir mereka).
+  const thisMonth = todayStr.slice(0, 7);
+  const activePegawai = users.filter((u) => u.role === 'pegawai' && u.status !== 'Nonaktif');
+  const needUpdate = activePegawai.filter((u) => getTargetForMonth(u, targets, thisMonth).sourceMonth !== thisMonth);
+
+  const copyLastTargets = () => {
+    const entries: Target[] = [];
+    needUpdate.forEach((u, i) => {
+      const r = getTargetForMonth(u, targets, thisMonth);
+      if (r.visits <= 0 && r.newCustomers <= 0) return;
+      entries.push({
+        id: `${Date.now()}${i}`, scope: 'pegawai', scopeId: u.id, scopeLabel: u.name,
+        period: 'bulanan', startDate: todayStr, visitTarget: r.visits, newCustomerTarget: r.newCustomers,
+      });
+    });
+    if (entries.length === 0) { alert('Belum ada target sebelumnya untuk disalin. Gunakan "Tambah Target".'); return; }
+    persist([...entries, ...targets]);
   };
 
   const filteredTargets = filterPeriod === 'Semua' ? targets : targets.filter((t) => t.period === filterPeriod);
@@ -199,6 +230,34 @@ const AdminTargets = ({
         </div>
         <Button onClick={openAddModal} variant="primary" className="py-2.5 w-auto px-6"><PlusCircle size={18} /> Tambah Target</Button>
       </div>
+
+      {needUpdate.length > 0 ? (
+        <Card className="p-4 border-amber-200 bg-amber-50">
+          <div className="flex items-start gap-3">
+            <AlertCircle size={20} className="text-amber-600 flex-shrink-0 mt-0.5" />
+            <div className="flex-1 min-w-0">
+              <p className="font-semibold text-amber-900 text-sm">Target {monthLabel(thisMonth)} belum diperbarui untuk {needUpdate.length} pegawai</p>
+              <p className="text-xs text-amber-800 mt-1">
+                {needUpdate.slice(0, 5).map((u) => u.name).join(', ')}{needUpdate.length > 5 ? `, +${needUpdate.length - 5} lainnya` : ''}.
+                Sementara target bulan lalu tetap berlaku. Target diperbarui sebulan sekali; yang tidak tercapai bulan lalu otomatis tercatat di riwayat akun pegawai.
+              </p>
+              <button onClick={copyLastTargets} className="mt-3 px-3 py-2 bg-amber-600 text-white rounded-lg text-xs font-semibold hover:bg-amber-700 flex items-center gap-1.5">
+                <Copy size={14} /> Salin Target Terakhir ke {monthLabel(thisMonth)}
+              </button>
+            </div>
+          </div>
+        </Card>
+      ) : activePegawai.length > 0 && (
+        <div className="flex items-center gap-2 text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-100 px-3 py-2 rounded-xl w-fit">
+          <CheckCircle size={14} /> Target {monthLabel(thisMonth)} sudah diperbarui untuk semua pegawai aktif.
+        </div>
+      )}
+
+      {notice && (
+        <div className={`p-3 rounded-xl text-sm font-medium border ${notice.status === 'ok' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : notice.status === 'warn' ? 'bg-amber-50 text-amber-800 border-amber-200' : 'bg-red-50 text-red-700 border-red-200'}`}>
+          {notice.status === 'ok' ? '✓ ' : '⚠ '}{notice.message}
+        </div>
+      )}
 
       <div className="flex gap-2 bg-slate-100 p-1 rounded-xl w-fit flex-wrap">
         {['Semua', 'harian', 'mingguan', 'bulanan'].map((p) => (

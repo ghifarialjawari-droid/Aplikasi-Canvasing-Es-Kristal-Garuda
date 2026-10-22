@@ -1,5 +1,7 @@
 import React, { useState } from 'react';
 import { FileText, Printer, Award, TrendingUp, Building2 } from 'lucide-react';
+import { localDateStr } from '../lib/dates';
+import { getTargetForMonth, TargetEntry } from '../lib/targets';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
 } from 'recharts';
@@ -75,21 +77,21 @@ function getRange(period: PeriodType, refDate: string): { start: string, end: st
     monday.setDate(ref.getDate() + diffToMonday);
     const sunday = new Date(monday);
     sunday.setDate(monday.getDate() + 6);
-    return { start: monday.toISOString().split('T')[0], end: sunday.toISOString().split('T')[0] };
+    return { start: localDateStr(monday), end: localDateStr(sunday) };
   }
   if (period === 'bulan') {
     const first = new Date(ref.getFullYear(), ref.getMonth(), 1);
     const last = new Date(ref.getFullYear(), ref.getMonth() + 1, 0);
-    return { start: first.toISOString().split('T')[0], end: last.toISOString().split('T')[0] };
+    return { start: localDateStr(first), end: localDateStr(last) };
   }
   // tahun
   const first = new Date(ref.getFullYear(), 0, 1);
   const last = new Date(ref.getFullYear(), 11, 31);
-  return { start: first.toISOString().split('T')[0], end: last.toISOString().split('T')[0] };
+  return { start: localDateStr(first), end: localDateStr(last) };
 }
 
-const AdminReports = ({ visits, users }: { visits: Visit[], users: User[] }) => {
-  const todayStr = new Date().toISOString().split('T')[0];
+const AdminReports = ({ visits, users, targets }: { visits: Visit[], users: User[], targets: TargetEntry[] }) => {
+  const todayStr = localDateStr();
   const [reportType, setReportType] = useState<'depot' | 'semua'>('depot');
   const [period, setPeriod] = useState<PeriodType>('bulan');
   const [refDate, setRefDate] = useState(todayStr);
@@ -100,6 +102,18 @@ const AdminReports = ({ visits, users }: { visits: Visit[], users: User[] }) => 
   const selectedCabang = selectedCabangRaw || cabangList[0] || '';
 
   const { start, end } = getRange(period, refDate);
+
+  // Target per pegawai mengikuti menu Target Canvasing (bukan angka bawaan akun).
+  // Periode tahunan = jumlah target 12 bulan; periode lain memakai target bulan acuan.
+  const targetOf = (u: User): number => {
+    const year = refDate.slice(0, 4);
+    if (period === 'tahun') {
+      let total = 0;
+      for (let m = 1; m <= 12; m++) total += getTargetForMonth(u, targets, `${year}-${m < 10 ? '0' : ''}${m}`).visits;
+      return total;
+    }
+    return getTargetForMonth(u, targets, refDate.slice(0, 7)).visits;
+  };
   const periodVisits = visits.filter(v => v.date >= start && v.date <= end);
 
   // ---------- LAPORAN PER DEPOT ----------
@@ -114,7 +128,7 @@ const AdminReports = ({ visits, users }: { visits: Visit[], users: User[] }) => 
   const totalKunjunganDepot = depotVisitsFiltered.length;
   const customerBaruDepot = depotVisitsFiltered.filter(v => v.isNewCustomer).length;
   const customerLamaDepot = totalKunjunganDepot - customerBaruDepot;
-  const targetDepot = pegawaiDepot.reduce((sum, u) => sum + (u.target?.visits || 0), 0);
+  const targetDepot = pegawaiDepot.reduce((sum, u) => sum + targetOf(u), 0);
   const pctDepot = targetDepot > 0 ? Math.min(100, Math.round((totalKunjunganDepot / targetDepot) * 100)) : 0;
 
   const rankingDepot = pegawaiDepot.map(u => {
@@ -131,7 +145,7 @@ const AdminReports = ({ visits, users }: { visits: Visit[], users: User[] }) => 
     for (let i = 0; i < diffDays; i++) {
       const d = new Date(startD);
       d.setDate(startD.getDate() + i);
-      const dateStr = d.toISOString().split('T')[0];
+      const dateStr = localDateStr(d);
       grafikHarianDepot.push({
         name: `${d.getDate()} ${dayNames[d.getDay()]}`,
         kunjungan: depotVisits.filter(v => v.date === dateStr).length,
@@ -143,7 +157,7 @@ const AdminReports = ({ visits, users }: { visits: Visit[], users: User[] }) => 
   const rankingSemuaDepot = cabangList.map((c) => {
     const cv = periodVisits.filter(v => v.cabang === c);
     const pegawaiC = users.filter(u => u.role === 'pegawai' && u.cabang === c);
-    const targetC = pegawaiC.reduce((sum, u) => sum + (u.target?.visits || 0), 0);
+    const targetC = pegawaiC.reduce((sum, u) => sum + targetOf(u), 0);
     return {
       cabang: c,
       visits: cv.length,
