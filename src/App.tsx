@@ -9,6 +9,8 @@ import {
 
 import { localDateStr, localMonthStr, formatHHmm, normalizeTimeStr } from './lib/dates';
 import { getTargetForMonth, buildTargetHistory } from './lib/targets';
+import { OutboxOp, loadOutbox, saveOutbox, enqueueOp, applyOutbox, isPending } from './lib/outbox';
+import { pickDailyRecord, uniqueDailyRecords, sortAttendanceDesc, sortVisitsDesc, sameList } from './lib/records';
 
 // AdminDashboard (pakai recharts) dan AdminMap (pakai leaflet) sengaja
 // dimuat "lazy" - hanya di-download saat Admin benar-benar membuka halaman
@@ -198,6 +200,26 @@ async function fetchWithRetry(url: string, options: RequestInit = {}, retriesLef
   }
 }
 
+// Menulis ke penyimpanan HP tanpa pernah melempar error. Kalau penuh, aplikasi
+// tetap jalan (sebelumnya error ini bisa menggagalkan pengiriman data).
+function safeSet(key: string, value: string) {
+  try { localStorage.setItem(key, value); } catch { /* penyimpanan HP penuh */ }
+}
+
+// Foto base64 berukuran besar; jangan ikut disimpan di salinan cadangan.
+function stripPhotos(arr: any): any {
+  return Array.isArray(arr)
+    ? arr.map((x: any) => (x && typeof x.photo === 'string' && x.photo.startsWith('data:') ? { ...x, photo: '' } : x))
+    : arr;
+}
+
+// Salinan daftar di HP (cadangan kalau server tidak terjangkau; di mode lokal
+// ini adalah penyimpanan utamanya).
+function persistList(collection: string, list: any[]) {
+  safeSet(`esgaruda_cache_${collection}`, JSON.stringify(stripPhotos(list)));
+  if (!GAS_API_URL) safeSet(`esgaruda_${collection}`, JSON.stringify(list));
+}
+
 const db = {
   async get(collection: string) {
     if (GAS_API_URL) {
@@ -225,7 +247,7 @@ const db = {
   async save(collection: string, data: any): Promise<{ ok: boolean, error?: string }> {
     // Simpan salinan cadangan di HP ini juga, supaya data tidak hilang
     // kalau koneksi ke server terputus saat menyimpan.
-    localStorage.setItem(`esgaruda_cache_${collection}`, JSON.stringify(data));
+    safeSet(`esgaruda_cache_${collection}`, JSON.stringify(data));
 
     if (GAS_API_URL) {
       try {
@@ -244,43 +266,14 @@ const db = {
         return { ok: false, error: String(err) };
       }
     } else {
-      localStorage.setItem(`esgaruda_${collection}`, JSON.stringify(data));
-      return { ok: true };
-    }
-  },
-  // Menambahkan SATU catatan baru (kunjungan/absensi baru) tanpa mengirim
-  // ulang seluruh riwayat - supaya tidak ada risiko dua penyimpanan yang
-  // waktunya berdekatan saling menimpa data satu sama lain.
-  async append(collection: string, fullArrayForCache: any[], newItem: any): Promise<{ ok: boolean, error?: string }> {
-    localStorage.setItem(`esgaruda_cache_${collection}`, JSON.stringify(fullArrayForCache));
-
-    if (GAS_API_URL) {
-      console.log(`[EKG] Mengirim data baru ke "${collection}"...`, newItem.id);
-      try {
-        const res = await fetchWithRetry(GAS_API_URL, {
-          method: 'POST',
-          body: JSON.stringify({ action: 'append', collection, item: newItem, key: GAS_API_KEY }),
-        });
-        const json = await res.json().catch(() => null);
-        if (json && json.error) {
-          console.error(`[EKG] Gagal simpan ke "${collection}":`, json.error);
-          return { ok: false, error: json.error };
-        }
-        console.log(`[EKG] Berhasil simpan ke "${collection}".`, json);
-        return { ok: true };
-      } catch (err) {
-        console.error(`[EKG] Gagal simpan ke "${collection}" (network/timeout):`, err);
-        return { ok: false, error: String(err) };
-      }
-    } else {
-      localStorage.setItem(`esgaruda_${collection}`, JSON.stringify(fullArrayForCache));
+      safeSet(`esgaruda_${collection}`, JSON.stringify(data));
       return { ok: true };
     }
   },
   // Memperbarui SATU catatan yang sudah ada (dicari berdasarkan id), misalnya
   // mengisi jam pulang pada catatan absen masuk yang sudah tersimpan.
   async upsert(collection: string, fullArrayForCache: any[], item: any): Promise<{ ok: boolean, error?: string }> {
-    localStorage.setItem(`esgaruda_cache_${collection}`, JSON.stringify(fullArrayForCache));
+    safeSet(`esgaruda_cache_${collection}`, JSON.stringify(fullArrayForCache));
 
     if (GAS_API_URL) {
       try {
@@ -299,32 +292,7 @@ const db = {
         return { ok: false, error: String(err) };
       }
     } else {
-      localStorage.setItem(`esgaruda_${collection}`, JSON.stringify(fullArrayForCache));
-      return { ok: true };
-    }
-  },
-  // Menghapus SATU catatan berdasarkan id, tanpa mengirim ulang seluruh data.
-  async remove(collection: string, fullArrayForCache: any[], id: string): Promise<{ ok: boolean, error?: string }> {
-    localStorage.setItem(`esgaruda_cache_${collection}`, JSON.stringify(fullArrayForCache));
-
-    if (GAS_API_URL) {
-      try {
-        const res = await fetchWithRetry(GAS_API_URL, {
-          method: 'POST',
-          body: JSON.stringify({ action: 'delete', collection, id, key: GAS_API_KEY }),
-        });
-        const json = await res.json().catch(() => null);
-        if (json && json.error) {
-          console.error(`API Error (delete "${collection}"):`, json.error);
-          return { ok: false, error: json.error };
-        }
-        return { ok: true };
-      } catch (err) {
-        console.error(`API Error (delete "${collection}"):`, err);
-        return { ok: false, error: String(err) };
-      }
-    } else {
-      localStorage.setItem(`esgaruda_${collection}`, JSON.stringify(fullArrayForCache));
+      safeSet(`esgaruda_${collection}`, JSON.stringify(fullArrayForCache));
       return { ok: true };
     }
   },
@@ -362,6 +330,24 @@ const db = {
     }
   }
 };
+
+// Mengirim SATU operasi dari antrean ke server. Dianggap berhasil hanya kalau
+// server membalas {success:true}.
+async function sendOp(op: OutboxOp): Promise<{ ok: boolean, error?: string }> {
+  if (!GAS_API_URL) return { ok: true }; // mode lokal: data sudah tersimpan di HP ini
+  const body = op.action === 'delete'
+    ? { action: 'delete', collection: op.collection, id: op.itemId, key: GAS_API_KEY }
+    : { action: op.action, collection: op.collection, item: op.item, key: GAS_API_KEY };
+  try {
+    const res = await fetchWithRetry(GAS_API_URL, { method: 'POST', body: JSON.stringify(body) });
+    const json = await res.json().catch(() => null);
+    if (!json) return { ok: false, error: 'Respons server tidak dapat dibaca' };
+    if (json.error) return { ok: false, error: String(json.error) };
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
 
 // Hasil menyimpan pengaturan, ditampilkan ke Admin
 type SaveStatus = { status: 'ok' | 'warn' | 'error', message: string };
@@ -496,10 +482,11 @@ const LoginScreen = ({ onLogin, users }: { onLogin: (u: User) => void, users: Us
 };
 
 const PegawaiDashboard = ({
-  user, visits, attendanceToday, onCheckIn, onCheckOut, attendanceLoading, attendanceSettings, targets
+  user, visits, attendanceToday, onCheckIn, onCheckOut, attendanceLoading, attendanceSettings, targets, attendanceLoaded, attendancePending
 }: {
   user: User, visits: Visit[], attendanceToday: Attendance | null,
-  onCheckIn: () => void, onCheckOut: () => void, attendanceLoading: boolean, attendanceSettings: AttendanceSettings, targets: Target[]
+  onCheckIn: () => void, onCheckOut: () => void, attendanceLoading: boolean, attendanceSettings: AttendanceSettings, targets: Target[],
+  attendanceLoaded: boolean, attendancePending: boolean
 }) => {
   const myVisits = visits.filter(v => v.pegawaiId === user.id);
   const todayDate = localDateStr();
@@ -614,8 +601,8 @@ const PegawaiDashboard = ({
           </div>
         )}
         {!attendanceToday ? (
-          <Button variant="primary" onClick={onCheckIn} disabled={attendanceLoading}>
-            <LogIn size={18} /> {attendanceLoading ? 'Mengambil Lokasi GPS...' : 'Absen Masuk'}
+          <Button variant="primary" onClick={onCheckIn} disabled={attendanceLoading || !attendanceLoaded}>
+            <LogIn size={18} /> {attendanceLoading ? 'Mengambil Lokasi GPS...' : !attendanceLoaded ? 'Memuat data absensi...' : 'Absen Masuk'}
           </Button>
         ) : !attendanceToday.checkOutTime ? (
           <div className="space-y-3">
@@ -635,6 +622,15 @@ const PegawaiDashboard = ({
               <CheckCircle size={18} /> Pulang: {attendanceToday.checkOutTime}
             </div>
           </div>
+        )}
+        {attendanceToday && (
+          attendancePending ? (
+            <div className="mt-3 flex items-center gap-2 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-100 p-2.5 rounded-lg">
+              <RefreshCw size={14} className="flex-shrink-0 animate-spin" /> Menunggu terkirim ke server. Dicoba ulang otomatis, pastikan internet aktif.
+            </div>
+          ) : (
+            <p className="mt-3 text-xs font-medium text-emerald-600 flex items-center gap-1"><CheckCircle size={12} /> Tersimpan di server</p>
+          )
         )}
       </Card>
 
@@ -960,11 +956,14 @@ const AttendanceScheduleForm = ({ settings, onSave }: { settings: AttendanceSett
 };
 
 const AdminAttendance = ({
-  attendance, users, attendanceSettings, onUpdateSettings
+  attendance, users, attendanceSettings, onUpdateSettings, onRefresh, lastSynced
 }: {
-  attendance: Attendance[], users: User[], attendanceSettings: AttendanceSettings, onUpdateSettings: (s: AttendanceSettings) => Promise<SaveStatus> | void
+  attendance: Attendance[], users: User[], attendanceSettings: AttendanceSettings, onUpdateSettings: (s: AttendanceSettings) => Promise<SaveStatus> | void,
+  onRefresh: () => Promise<void> | void, lastSynced: Date | null
 }) => {
   const todayStr = localDateStr();
+  const [refreshing, setRefreshing] = useState(false);
+  const doRefresh = async () => { setRefreshing(true); try { await onRefresh(); } finally { setRefreshing(false); } };
   const [innerTab, setInnerTab] = useState<'rekap' | 'jadwal'>('rekap');
   const [filterCabang, setFilterCabang] = useState('Semua');
   const [filterDate, setFilterDate] = useState(todayStr);
@@ -973,8 +972,8 @@ const AdminAttendance = ({
 
   const activePegawai = users.filter(u => u.role === 'pegawai' && u.status === 'Aktif' && (filterCabang === 'Semua' || u.cabang === filterCabang));
 
-  const dayRecords = attendance.filter(a => {
-    if (a.date !== filterDate) return false;
+  // Satu catatan per pegawai per hari (baris ganda dari absen di dua HP dirapikan)
+  const dayRecords = uniqueDailyRecords(attendance, filterDate).filter(a => {
     const peg = users.find(u => u.id === a.pegawaiId);
     if (filterCabang !== 'Semua' && peg?.cabang !== filterCabang) return false;
     return true;
@@ -991,9 +990,17 @@ const AdminAttendance = ({
 
   return (
     <div className="p-6 md:p-8 space-y-6 bg-slate-50 min-h-screen">
-      <div>
-        <h1 className="text-2xl md:text-3xl font-bold text-slate-800">Absensi Karyawan</h1>
-        <p className="text-slate-500">Rekap kehadiran pegawai lapangan berbasis GPS.</p>
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div>
+          <h1 className="text-2xl md:text-3xl font-bold text-slate-800">Absensi Karyawan</h1>
+          <p className="text-slate-500">Rekap kehadiran pegawai lapangan berbasis GPS.</p>
+        </div>
+        <div className="flex items-center gap-3">
+          {lastSynced && <span className="text-xs text-slate-400">Diperbarui {formatHHmm(lastSynced)}</span>}
+          <button onClick={doRefresh} disabled={refreshing} className="px-3 py-2 bg-white border border-slate-200 text-slate-700 rounded-xl text-sm font-semibold hover:border-blue-600 hover:text-blue-600 flex items-center gap-1.5 shadow-sm disabled:opacity-60">
+            <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} /> Segarkan
+          </button>
+        </div>
       </div>
 
       <div className="flex gap-2 bg-slate-100 p-1 rounded-xl w-fit">
@@ -1677,7 +1684,19 @@ export default function App() {
   const lastLocalWriteRef = useRef(0);
   const refreshingRef = useRef(false);
   const lastRefreshRef = useRef(0);
-  const refreshConfigRef = useRef<(force?: boolean) => void>(() => {});
+  const refreshDataRef = useRef<(force?: boolean) => Promise<void>>(async () => {});
+
+  // Antrean kirim: perubahan kunjungan/absensi disimpan di HP lebih dulu, lalu
+  // dikirim ke server dan dicoba ulang otomatis sampai benar-benar berhasil.
+  const [outbox, setOutbox] = useState<OutboxOp[]>(() => loadOutbox());
+  const outboxRef = useRef<OutboxOp[]>(outbox);
+  const flushingRef = useRef(false);
+  const inflightIdRef = useRef<string | null>(null);
+  const opsDoneRef = useRef(0);
+  const flushOutboxRef = useRef<() => Promise<void>>(async () => {});
+  const [outboxError, setOutboxError] = useState<string | null>(null);
+  const [lastSynced, setLastSynced] = useState<Date | null>(null);
+  const [attendanceLoaded, setAttendanceLoaded] = useState(false);
 
   const showNotice = (type: 'success' | 'warning', text: string) => {
     setNotice({ type, text });
@@ -1690,9 +1709,8 @@ export default function App() {
     setIsOnline(navigator.onLine);
     const goOnline = () => {
       setIsOnline(true);
-      db.get('visits').then((v) => setVisits(v.length > 0 ? v : defaultVisits));
-      db.get('attendance').then((a) => setAttendance(a || []));
-      refreshConfigRef.current(true);
+      flushOutboxRef.current();
+      refreshDataRef.current(true);
     };
     const goOffline = () => setIsOnline(false);
     window.addEventListener('online', goOnline);
@@ -1739,10 +1757,12 @@ export default function App() {
       }
     });
     visitsPromise.then((loadedVisits) => {
-      setVisits(loadedVisits.length > 0 ? loadedVisits : defaultVisits);
+      const base = loadedVisits.length > 0 ? loadedVisits : (GAS_API_URL ? [] : defaultVisits);
+      setVisits(sortVisitsDesc(applyOutbox(base as Visit[], outboxRef.current, 'visits')));
     });
     attendancePromise.then((loadedAttendance) => {
-      setAttendance(loadedAttendance || []);
+      setAttendance(sortAttendanceDesc(applyOutbox((loadedAttendance || []) as Attendance[], outboxRef.current, 'attendance')));
+      setAttendanceLoaded(true);
     });
     settingsPromise.then((loadedSettings) => {
       setAttendanceSettings(loadedSettings && loadedSettings.length > 0 ? sanitizeAttendanceSettings(loadedSettings[0]) : defaultAttendanceSettings);
@@ -1784,41 +1804,83 @@ export default function App() {
     return result;
   };
 
-  const appendToDB = async (collection: string, fullArray: any[], newItem: any) => {
-    const result = await trackWrite(() => db.append(collection, fullArray, newItem));
-    if (!result.ok) reportSaveFailure(collection);
-    return result;
+  // ===== Antrean kirim (outbox) =====
+  const commitOutbox = (ops: OutboxOp[]) => {
+    outboxRef.current = ops;
+    saveOutbox(ops);
+    setOutbox(ops);
   };
 
-  const upsertToDB = async (collection: string, fullArray: any[], item: any) => {
-    const result = await trackWrite(() => db.upsert(collection, fullArray, item));
-    if (!result.ok) reportSaveFailure(collection);
-    return result;
+  // Mengirim semua operasi antrean ke server satu per satu, berurutan. Kalau
+  // ada yang gagal, berhenti dan dicoba lagi otomatis (tiap 15 detik, saat
+  // internet kembali, atau saat aplikasi dibuka lagi).
+  const flushOutbox = async () => {
+    if (flushingRef.current) return;
+    if (outboxRef.current.length === 0) return;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+    flushingRef.current = true;
+    setSyncing(true);
+    try {
+      while (outboxRef.current.length > 0) {
+        const op = outboxRef.current[0];
+        inflightIdRef.current = op.id;
+        const res = await sendOp(op);
+        inflightIdRef.current = null;
+        if (!res.ok) {
+          setOutboxError(res.error || 'gagal mengirim');
+          break;
+        }
+        opsDoneRef.current += 1;
+        setOutboxError(null);
+        commitOutbox(outboxRef.current.filter((o) => o.id !== op.id));
+      }
+    } finally {
+      inflightIdRef.current = null;
+      flushingRef.current = false;
+      setSyncing(false);
+    }
+  };
+  flushOutboxRef.current = flushOutbox;
+
+  // Memasukkan perubahan ke antrean lalu langsung mencoba mengirim
+  const queueWrite = (op: { action: 'append' | 'upsert' | 'delete', collection: 'visits' | 'attendance', itemId: string, item?: any }) => {
+    commitOutbox(enqueueOp(outboxRef.current, op, inflightIdRef.current));
+    flushOutboxRef.current();
   };
 
-  const deleteFromDB = async (collection: string, fullArray: any[], id: string) => {
-    const result = await trackWrite(() => db.remove(collection, fullArray, id));
-    if (!result.ok) reportSaveFailure(collection, 'menghapus');
-    return result;
-  };
-
-  // Penyegaran otomatis pengaturan yang diatur Admin (jadwal absen, target,
-  // jenis usaha) supaya perubahan langsung berlaku di akun lain tanpa harus
-  // menutup-buka aplikasi.
-  const refreshConfig = async (force = false) => {
+  // Penyegaran data dari server: kunjungan & absensi (digabung dengan perubahan
+  // yang masih mengantre, jadi tidak pernah menimpa data yang belum terkirim)
+  // serta pengaturan Admin (jadwal absen, target, jenis usaha).
+  const refreshData = async (force = false) => {
     if (!GAS_API_URL) return; // mode lokal: tidak ada server bersama untuk disinkronkan
     if (refreshingRef.current) return;
-    if (!force && Date.now() - lastRefreshRef.current < 20000) return;
+    if (!force && Date.now() - lastRefreshRef.current < 15000) return;
     refreshingRef.current = true;
     const startedAt = Date.now();
-    const res = await db.fetchFresh(['settings', 'targets', 'businessTypes']);
+    const doneAtStart = opsDoneRef.current;
+    const res = await db.fetchFresh(['settings', 'targets', 'businessTypes', 'attendance', 'visits']);
     refreshingRef.current = false;
     lastRefreshRef.current = Date.now();
     if (!res.ok) return;
-    // Jangan timpa kalau ada penyimpanan lokal yang sedang/baru berjalan
-    if (pendingWritesRef.current > 0 || lastLocalWriteRef.current >= startedAt) return;
-
+    setLastSynced(new Date());
     const data = res.data;
+
+    // Dilewati kalau antrean sedang/baru saja mengirim (data server bisa belum
+    // memuat kiriman itu); diterapkan pada penyegaran berikutnya.
+    if (!flushingRef.current && opsDoneRef.current === doneAtStart) {
+      if (Array.isArray(data.attendance)) {
+        const next = sortAttendanceDesc(applyOutbox(data.attendance as Attendance[], outboxRef.current, 'attendance'));
+        setAttendance((prev) => (sameList(prev, next) ? prev : next));
+        setAttendanceLoaded(true);
+      }
+      if (Array.isArray(data.visits)) {
+        const next = sortVisitsDesc(applyOutbox(data.visits as Visit[], outboxRef.current, 'visits'));
+        setVisits((prev) => (sameList(prev, next) ? prev : next));
+      }
+    }
+
+    // Pengaturan: jangan timpa kalau ada penyimpanan lokal yang sedang/baru berjalan
+    if (pendingWritesRef.current > 0 || lastLocalWriteRef.current >= startedAt) return;
     if (data.settings && data.settings.length > 0) {
       const next = sanitizeAttendanceSettings(data.settings[0]);
       setAttendanceSettings((prev) => (settingsEqual(prev, next) ? prev : next));
@@ -1832,7 +1894,7 @@ export default function App() {
       if (names.length > 0) setBusinessTypes((prev) => (prev.join('|') === names.join('|') ? prev : names));
     }
   };
-  refreshConfigRef.current = refreshConfig;
+  refreshDataRef.current = refreshData;
 
   const handleUsersUpdate = (newUsers: User[]) => {
     setUsers(newUsers);
@@ -1890,8 +1952,13 @@ export default function App() {
   const handleLogin = (loggedInUser: User) => {
     setUser(loggedInUser);
     localStorage.setItem('esgaruda_session', JSON.stringify({ id: loggedInUser.id, loginAt: Date.now() }));
-    const updatedUsers = users.map(u => u.id === loggedInUser.id ? { ...u, lastLogin: new Date().toLocaleString('id-ID') } : u);
-    handleUsersUpdate(updatedUsers);
+    // Hanya baris pengguna ini yang diperbarui. Sebelumnya SELURUH daftar pengguna
+    // ditimpa dari data di HP ini - kalau HP itu belum memuat pegawai baru yang
+    // ditambah Admin, pegawai baru tersebut ikut terhapus dari spreadsheet.
+    const stamped = { ...loggedInUser, lastLogin: new Date().toLocaleString('id-ID') };
+    const updatedUsers = users.map(u => u.id === loggedInUser.id ? stamped : u);
+    setUsers(updatedUsers);
+    db.upsert('users', updatedUsers, stamped);
   };
 
   const handleLogout = () => {
@@ -1944,7 +2011,8 @@ export default function App() {
   const handleAddVisit = (newVisit: Visit) => {
     const updatedVisits = [newVisit, ...visits];
     setVisits(updatedVisits);
-    appendToDB('visits', updatedVisits, newVisit);
+    persistList('visits', updatedVisits);
+    queueWrite({ action: 'append', collection: 'visits', itemId: newVisit.id, item: newVisit });
     setCurrentTab('home');
   };
 
@@ -1956,17 +2024,20 @@ export default function App() {
     const merged = { ...existing, ...updates };
     const updatedVisits = visits.map(v => v.id === visitId ? merged : v);
     setVisits(updatedVisits);
-    upsertToDB('visits', updatedVisits, merged);
+    persistList('visits', updatedVisits);
+    queueWrite({ action: 'upsert', collection: 'visits', itemId: visitId, item: merged });
   };
 
   const handleDeleteVisit = (visitId: string) => {
     const updatedVisits = visits.filter(v => v.id !== visitId);
     setVisits(updatedVisits);
-    deleteFromDB('visits', updatedVisits, visitId);
+    persistList('visits', updatedVisits);
+    queueWrite({ action: 'delete', collection: 'visits', itemId: visitId });
   };
 
   const todayStr = localDateStr();
-  const attendanceToday = user ? attendance.find(a => a.pegawaiId === user.id && a.date === todayStr) || null : null;
+  const attendanceToday = user ? pickDailyRecord(attendance, user.id, todayStr) : null;
+  const attendancePending = !!user && outbox.some(o => o.collection === 'attendance' && o.action !== 'delete' && o.item && o.item.pegawaiId === user.id && o.item.date === todayStr);
 
   const handleCheckIn = () => {
     if (!user) return;
@@ -1994,7 +2065,21 @@ export default function App() {
 
     setAttendanceLoading(true);
     navigator.geolocation.getCurrentPosition(
-      (pos) => {
+      async (pos) => {
+        // Pastikan belum tercatat (mis. sudah absen dari HP lain, atau data di HP
+        // ini belum diperbarui) supaya tidak terjadi absen ganda.
+        const fresh = await db.fetchFresh(['attendance']);
+        if (fresh.ok) {
+          const serverList = (fresh.data.attendance || []) as Attendance[];
+          const existing = pickDailyRecord(serverList, user.id, localDateStr());
+          if (existing) {
+            setAttendance(sortAttendanceDesc(applyOutbox(serverList, outboxRef.current, 'attendance')));
+            setAttendanceLoading(false);
+            alert(`Anda sudah absen masuk hari ini pukul ${existing.checkInTime}.`);
+            return;
+          }
+        }
+
         const now = new Date();
         const timeStr = formatHHmm(now);
         let status: Attendance['status'] = 'Tepat Waktu';
@@ -2012,9 +2097,12 @@ export default function App() {
           checkInLng: pos.coords.longitude,
           status,
         };
-        const updated = [newAtt, ...attendance];
-        setAttendance(updated);
-        appendToDB('attendance', updated, newAtt);
+        setAttendance((prev) => {
+          const next = [newAtt, ...prev];
+          persistList('attendance', next);
+          return next;
+        });
+        queueWrite({ action: 'append', collection: 'attendance', itemId: newAtt.id, item: newAtt });
         setAttendanceLoading(false);
       },
       () => { alert('Gagal mengambil lokasi GPS. Pastikan GPS aktif.'); setAttendanceLoading(false); },
@@ -2046,9 +2134,12 @@ export default function App() {
       (pos) => {
         const timeStr = formatHHmm();
         const updatedRecord = { ...attendanceToday, checkOutTime: timeStr, checkOutLat: pos.coords.latitude, checkOutLng: pos.coords.longitude };
-        const updated = attendance.map(a => a.id === attendanceToday.id ? updatedRecord : a);
-        setAttendance(updated);
-        upsertToDB('attendance', updated, updatedRecord);
+        setAttendance((prev) => {
+          const next = prev.map(a => a.id === attendanceToday.id ? updatedRecord : a);
+          persistList('attendance', next);
+          return next;
+        });
+        queueWrite({ action: 'upsert', collection: 'attendance', itemId: attendanceToday.id, item: updatedRecord });
         setAttendanceLoading(false);
       },
       () => { alert('Gagal mengambil lokasi GPS. Pastikan GPS aktif.'); setAttendanceLoading(false); },
@@ -2061,16 +2152,21 @@ export default function App() {
   // begitu perubahan jadwal absen/target dari Admin langsung berlaku di semua akun.
   useEffect(() => {
     if (!user) return;
-    refreshConfigRef.current(true);
-    const onVisible = () => { if (document.visibilityState === 'visible') refreshConfigRef.current(); };
-    const onFocus = () => refreshConfigRef.current();
+    flushOutboxRef.current();
+    refreshDataRef.current(true);
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') { flushOutboxRef.current(); refreshDataRef.current(); }
+    };
+    const onFocus = () => { flushOutboxRef.current(); refreshDataRef.current(); };
     const interval = setInterval(() => {
-      if (document.visibilityState === 'visible') refreshConfigRef.current(true);
-    }, 60000);
+      if (document.visibilityState === 'visible') refreshDataRef.current(true);
+    }, 45000);
+    const retry = setInterval(() => flushOutboxRef.current(), 15000);
     document.addEventListener('visibilitychange', onVisible);
     window.addEventListener('focus', onFocus);
     return () => {
       clearInterval(interval);
+      clearInterval(retry);
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('focus', onFocus);
     };
@@ -2115,6 +2211,7 @@ export default function App() {
           <div className="p-4 hidden md:block border-t border-blue-600">
             {syncing && <div className="text-xs text-blue-200 mb-2 flex items-center gap-1 justify-center"><RefreshCw size={12} className="animate-spin" /> Sinkronisasi Database...</div>}
             {!isOnline && <div className="text-xs text-yellow-200 mb-2 flex items-center gap-1 justify-center"><WifiOff size={12} /> Sedang Offline</div>}
+            {outbox.length > 0 && <button onClick={() => flushOutboxRef.current()} className="text-xs text-amber-200 mb-2 w-full flex items-center gap-1 justify-center hover:text-white">{outbox.length} data menunggu terkirim (ketuk untuk kirim)</button>}
             <div className="flex items-center gap-3 mb-4">
               <div className="w-10 h-10 rounded-full bg-blue-500 flex items-center justify-center font-bold">{user.name.charAt(0)}</div>
               <div>
@@ -2128,11 +2225,11 @@ export default function App() {
 
         <main className="flex-1 overflow-y-auto pb-20 md:pb-0">
           <Suspense fallback={<AdminSectionLoading />}>
-            {adminTab === 'dashboard' && <AdminDashboard visits={visits} users={users} attendance={attendance} />}
+            {adminTab === 'dashboard' && <AdminDashboard visits={visits} users={users} attendance={attendance} onRefresh={() => refreshDataRef.current(true)} lastSynced={lastSynced} />}
             {adminTab === 'map' && <AdminMap visits={visits} users={users} />}
             {adminTab === 'reports' && <AdminReports visits={visits} users={users} targets={targets} />}
           </Suspense>
-          {adminTab === 'attendance' && <AdminAttendance attendance={attendance} users={users} attendanceSettings={attendanceSettings} onUpdateSettings={handleUpdateAttendanceSettings} />}
+          {adminTab === 'attendance' && <AdminAttendance attendance={attendance} users={users} attendanceSettings={attendanceSettings} onUpdateSettings={handleUpdateAttendanceSettings} onRefresh={() => refreshDataRef.current(true)} lastSynced={lastSynced} />}
           {adminTab === 'employees' && <AdminEmployees users={users} setUsers={handleUsersUpdate} addAuditLog={addAuditLog} targets={targets} onUpdateTargets={handleUpdateTargets} businessTypes={businessTypes} onUpdateBusinessTypes={handleUpdateBusinessTypes} />}
           {adminTab === 'customers' && <CustomerDatabase visits={visits} users={users} isAdmin={true} />}
           {adminTab === 'canvasing' && <AdminCanvasing user={user} users={users} businessTypes={businessTypes} visits={visits} targets={targets} onAddVisit={handleAddVisit} onEditVisit={handleEditVisit} onDeleteVisit={handleDeleteVisit} onUpdateTargets={handleUpdateTargets} />}
@@ -2191,6 +2288,11 @@ export default function App() {
           <div className="flex items-center gap-3">
             {syncing && <RefreshCw size={16} className="text-slate-400 animate-spin" />}
             {!isOnline && <WifiOff size={16} className="text-yellow-500" />}
+            {outbox.length > 0 && (
+              <button onClick={() => flushOutboxRef.current()} title={outboxError || 'Ketuk untuk mengirim sekarang'} className="text-[10px] font-bold text-amber-700 bg-amber-50 border border-amber-200 px-2 py-1 rounded-full">
+                {outbox.length} menunggu kirim
+              </button>
+            )}
             <button onClick={confirmLogout} className="p-2 text-red-500 hover:text-red-600 hover:bg-red-50 transition-colors rounded-full">
               <LogOut size={20} />
             </button>
@@ -2207,6 +2309,8 @@ export default function App() {
               attendanceLoading={attendanceLoading}
               attendanceSettings={attendanceSettings}
               targets={targets}
+              attendanceLoaded={attendanceLoaded}
+              attendancePending={attendancePending}
             />
           )}
           {currentTab === 'canvassing' && <CanvassingForm user={user} onSubmit={handleAddVisit} businessTypes={businessTypes} />}

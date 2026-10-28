@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { Clock, AlertTriangle, MapPin, ExternalLink, CalendarDays } from 'lucide-react';
-import { localDateStr } from '../lib/dates';
+import { Clock, AlertTriangle, MapPin, ExternalLink, CalendarDays, RefreshCw } from 'lucide-react';
+import { localDateStr, formatHHmm } from '../lib/dates';
+import { uniqueDailyRecords } from '../lib/records';
 
 // Tipe data disalin dari App.tsx supaya file ini berdiri sendiri
 // (bisa di-lazy-load terpisah tanpa ikut menyeret komponen lain).
@@ -30,6 +31,7 @@ interface Attendance {
   pegawaiId: string;
   date: string;
   checkInTime: string;
+  checkOutTime?: string;
   status: string;
 }
 
@@ -40,10 +42,13 @@ const Card = ({ children, className = '' }: { children: React.ReactNode, classNa
 );
 
 const AdminDashboard = ({
-  visits, users, attendance
+  visits, users, attendance, onRefresh, lastSynced
 }: {
-  visits: Visit[], users: User[], attendance: Attendance[]
+  visits: Visit[], users: User[], attendance: Attendance[],
+  onRefresh?: () => Promise<void> | void, lastSynced?: Date | null
 }) => {
+  const [refreshing, setRefreshing] = useState(false);
+  const doRefresh = async () => { if (!onRefresh) return; setRefreshing(true); try { await onRefresh(); } finally { setRefreshing(false); } };
   const todayStr = localDateStr();
   const [canvasDate, setCanvasDate] = useState(todayStr);
   const isToday = canvasDate === todayStr;
@@ -54,7 +59,8 @@ const AdminDashboard = ({
   };
 
   const activePegawai = users.filter(u => u.role === 'pegawai' && u.status === 'Aktif');
-  const todayAttendance = attendance.filter(a => a.date === todayStr);
+  // Satu catatan per pegawai (baris ganda dari absen di dua HP dirapikan)
+  const todayAttendance = uniqueDailyRecords(attendance, todayStr);
   const hadirCount = todayAttendance.length;
   const terlambatCount = todayAttendance.filter(a => a.status === 'Terlambat').length;
   const belumAbsenCount = Math.max(0, activePegawai.length - hadirCount);
@@ -68,9 +74,19 @@ const AdminDashboard = ({
 
   return (
     <div className="p-6 md:p-8 space-y-8 bg-slate-50 min-h-screen">
-      <div>
-        <h1 className="text-2xl md:text-3xl font-bold text-slate-800">Dashboard</h1>
-        <p className="text-slate-500">Ringkasan absensi & canvasing hari ini.</p>
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div>
+          <h1 className="text-2xl md:text-3xl font-bold text-slate-800">Dashboard</h1>
+          <p className="text-slate-500">Ringkasan absensi & canvasing hari ini.</p>
+        </div>
+        {onRefresh && (
+          <div className="flex items-center gap-3">
+            {lastSynced && <span className="text-xs text-slate-400">Diperbarui {formatHHmm(lastSynced)}</span>}
+            <button onClick={doRefresh} disabled={refreshing} className="px-3 py-2 bg-white border border-slate-200 text-slate-700 rounded-xl text-sm font-semibold hover:border-blue-600 hover:text-blue-600 flex items-center gap-1.5 shadow-sm disabled:opacity-60">
+              <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} /> Segarkan
+            </button>
+          </div>
+        )}
       </div>
 
       {/* ABSENSI KARYAWAN */}
