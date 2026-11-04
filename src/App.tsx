@@ -203,6 +203,34 @@ async function fetchWithRetry(url: string, options: RequestInit = {}, retriesLef
   }
 }
 
+// Mengambil lokasi HP. Coba GPS akurasi tinggi dulu; kalau gagal atau terlalu
+// lama (sering terjadi di dalam ruangan), ulangi dengan akurasi biasa
+// (WiFi/sinyal seluler) yang jauh lebih cepat. Pesan error dibedakan per penyebab.
+function requestLocation(onSuccess: (pos: GeolocationPosition) => void, onError: (message: string) => void) {
+  if (!('geolocation' in navigator)) { onError('Browser tidak mendukung GPS.'); return; }
+  const explain = (err: GeolocationPositionError) => {
+    if (err.code === 1) {
+      return 'Izin lokasi ditolak. Izinkan lokasi untuk situs ini (ketuk ikon di kiri alamat web > Izin > Lokasi > Izinkan) dan untuk Chrome (Pengaturan HP > Aplikasi > Chrome > Izin > Lokasi), lalu coba lagi.';
+    }
+    if (err.code === 2) {
+      return 'Lokasi tidak tersedia. Pastikan Lokasi/GPS HP aktif (mode akurasi tinggi), lalu coba lagi di dekat jendela atau tempat terbuka.';
+    }
+    return 'Waktu mengambil lokasi habis. Coba lagi di dekat jendela atau tempat terbuka.';
+  };
+  navigator.geolocation.getCurrentPosition(
+    onSuccess,
+    (err) => {
+      if (err.code === 1) { onError(explain(err)); return; } // izin ditolak: percuma diulang
+      navigator.geolocation.getCurrentPosition(
+        onSuccess,
+        (err2) => onError(explain(err2)),
+        { enableHighAccuracy: false, timeout: 20000, maximumAge: 120000 }
+      );
+    },
+    { enableHighAccuracy: true, timeout: 15000, maximumAge: 30000 }
+  );
+}
+
 // Menulis ke penyimpanan HP tanpa pernah melempar error. Kalau penuh, aplikasi
 // tetap jalan (sebelumnya error ini bisa menggagalkan pengiriman data).
 function safeSet(key: string, value: string) {
@@ -735,22 +763,16 @@ const CanvassingForm = ({ user, onSubmit, businessTypes }: { user: User, onSubmi
   const getLocation = () => {
     setLocating(true);
     setLocError('');
-    if ('geolocation' in navigator) {
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          setLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude });
-          setLocating(false);
-        },
-        () => {
-          setLocError('Gagal mendapat lokasi. Pastikan GPS/Location service aktif di HP Anda.');
-          setLocating(false);
-        },
-        { enableHighAccuracy: true, timeout: 10000 }
-      );
-    } else {
-      setLocError('Browser tidak mendukung GPS.');
-      setLocating(false);
-    }
+    requestLocation(
+      (pos) => {
+        setLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        setLocating(false);
+      },
+      (message) => {
+        setLocError(message);
+        setLocating(false);
+      }
+    );
   };
 
   const handlePhotoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -2123,7 +2145,7 @@ export default function App() {
     }
 
     setAttendanceLoading(true);
-    navigator.geolocation.getCurrentPosition(
+    requestLocation(
       async (pos) => {
         // Pastikan belum tercatat (mis. sudah absen dari HP lain, atau data di HP
         // ini belum diperbarui) supaya tidak terjadi absen ganda.
@@ -2164,8 +2186,7 @@ export default function App() {
         queueWrite({ action: 'append', collection: 'attendance', itemId: newAtt.id, item: newAtt });
         setAttendanceLoading(false);
       },
-      () => { alert('Gagal mengambil lokasi GPS. Pastikan GPS aktif.'); setAttendanceLoading(false); },
-      { enableHighAccuracy: true, timeout: 10000 }
+      (message) => { alert(message); setAttendanceLoading(false); }
     );
   };
 
@@ -2189,7 +2210,7 @@ export default function App() {
     }
 
     setAttendanceLoading(true);
-    navigator.geolocation.getCurrentPosition(
+    requestLocation(
       (pos) => {
         const timeStr = formatHHmm();
         const updatedRecord = { ...attendanceToday, checkOutTime: timeStr, checkOutLat: pos.coords.latitude, checkOutLng: pos.coords.longitude };
@@ -2201,8 +2222,7 @@ export default function App() {
         queueWrite({ action: 'upsert', collection: 'attendance', itemId: attendanceToday.id, item: updatedRecord });
         setAttendanceLoading(false);
       },
-      () => { alert('Gagal mengambil lokasi GPS. Pastikan GPS aktif.'); setAttendanceLoading(false); },
-      { enableHighAccuracy: true, timeout: 10000 }
+      (message) => { alert(message); setAttendanceLoading(false); }
     );
   };
 
