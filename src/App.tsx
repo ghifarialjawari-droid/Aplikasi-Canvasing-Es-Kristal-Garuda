@@ -9,7 +9,7 @@ import {
 
 import { localDateStr, localMonthStr, formatHHmm, normalizeTimeStr } from './lib/dates';
 import { getTargetForMonth, buildTargetHistory } from './lib/targets';
-import { OutboxOp, loadOutbox, saveOutbox, enqueueOp, applyOutbox, isPending } from './lib/outbox';
+import { OutboxOp, loadOutbox, enqueueOp, applyOutbox, isPending, OUTBOX_KEY } from './lib/outbox';
 import { pickDailyRecord, uniqueDailyRecords, sortAttendanceDesc, sortVisitsDesc, sameList } from './lib/records';
 
 // AdminDashboard (pakai recharts) dan AdminMap (pakai leaflet) sengaja
@@ -33,6 +33,9 @@ const GAS_API_URL = "https://script.google.com/macros/s/AKfycbw1WM795b0RuqMkb81m
 // milikmu sendiri, lalu gunakan teks yang SAMA PERSIS di variabel
 // API_KEY pada Code.gs.
 const GAS_API_KEY = "";
+
+// Harus sama dengan CODE_VERSION di Code.gs. Kalau beda, aplikasi memberi peringatan.
+const EXPECTED_SERVER_VERSION = 'canvasing-v3';
 
 type Role = 'admin' | 'pegawai' | 'owner';
 
@@ -294,6 +297,22 @@ const db = {
     } else {
       safeSet(`esgaruda_${collection}`, JSON.stringify(fullArrayForCache));
       return { ok: true };
+    }
+  },
+  // Menghapus SATU catatan di server (dicari berdasarkan id)
+  async remove(collection: string, id: string): Promise<{ ok: boolean, error?: string }> {
+    if (!GAS_API_URL) return { ok: true };
+    try {
+      const res = await fetchWithRetry(GAS_API_URL, {
+        method: 'POST',
+        body: JSON.stringify({ action: 'delete', collection, id, key: GAS_API_KEY }),
+      });
+      const json = await res.json().catch(() => null);
+      if (!json) return { ok: false, error: 'Respons server tidak dapat dibaca' };
+      if (json.error) return { ok: false, error: String(json.error) };
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String(err) };
     }
   },
   // Mengambil data SEGAR langsung dari server (tanpa cadangan lokal), dipakai
@@ -1677,6 +1696,7 @@ export default function App() {
   const [isOnline, setIsOnline] = useState(true);
   const [syncError, setSyncError] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ type: 'success' | 'warning', text: string } | null>(null);
+  const [serverMsg, setServerMsg] = useState<string | null>(null);
 
   // Pelacak penyimpanan lokal, supaya penyegaran otomatis dari server tidak
   // menimpa perubahan yang baru saja dibuat dan masih dalam proses dikirim.
@@ -1702,6 +1722,19 @@ export default function App() {
     setNotice({ type, text });
     setTimeout(() => setNotice(null), type === 'success' ? 4000 : 9000);
   };
+
+  // Cek versi Apps Script di server. Kalau deployment masih versi lama (atau
+  // kunci berbeda), antrean kirim tidak akan pernah berhasil - beri tahu pengguna.
+  useEffect(() => {
+    if (!GAS_API_URL) return;
+    fetchWithTimeout(`${GAS_API_URL}?action=ping&key=${encodeURIComponent(GAS_API_KEY)}`)
+      .then((r) => r.json())
+      .then((j) => {
+        setServerMsg(j && j.version === EXPECTED_SERVER_VERSION ? null
+          : 'Server Apps Script belum versi terbaru. Buka Apps Script > Deploy > Manage deployments > ikon pensil > Version: New version > Deploy.');
+      })
+      .catch(() => { /* offline: dicek lagi saat aplikasi dibuka ulang */ });
+  }, []);
 
   // Pantau status koneksi supaya bisa tampil peringatan "Sedang Offline"
   // dan otomatis menyegarkan data begitu koneksi kembali (reconnect otomatis).
@@ -1807,7 +1840,11 @@ export default function App() {
   // ===== Antrean kirim (outbox) =====
   const commitOutbox = (ops: OutboxOp[]) => {
     outboxRef.current = ops;
-    saveOutbox(ops);
+    try {
+      localStorage.setItem(OUTBOX_KEY, JSON.stringify(ops));
+    } catch {
+      showNotice('warning', 'Memori HP penuh. Pastikan internet aktif agar data cepat terkirim.');
+    }
     setOutbox(ops);
   };
 
@@ -1827,7 +1864,8 @@ export default function App() {
         const res = await sendOp(op);
         inflightIdRef.current = null;
         if (!res.ok) {
-          setOutboxError(res.error || 'gagal mengirim');
+          const raw = res.error || 'gagal mengirim';
+          setOutboxError(raw.indexOf('tidak dikenali') !== -1 ? 'Apps Script di server belum versi terbaru' : /fetch|abort|network/i.test(raw) ? 'koneksi ke server terputus' : raw);
           break;
         }
         opsDoneRef.current += 1;
@@ -1858,9 +1896,12 @@ export default function App() {
     refreshingRef.current = true;
     const startedAt = Date.now();
     const doneAtStart = opsDoneRef.current;
-    const res = await db.fetchFresh(['settings', 'targets', 'businessTypes', 'attendance', 'visits']);
-    refreshingRef.current = false;
-    lastRefreshRef.current = Date.now();
+    // Selalu dibuka lagi walaupun permintaan gagal, supaya penyegaran tidak macet
+    const res = await db.fetchFresh(['settings', 'targets', 'businessTypes', 'attendance', 'visits', 'users'])
+      .finally(() => {
+        refreshingRef.current = false;
+        lastRefreshRef.current = Date.now();
+      });
     if (!res.ok) return;
     setLastSynced(new Date());
     const data = res.data;
@@ -1881,6 +1922,10 @@ export default function App() {
 
     // Pengaturan: jangan timpa kalau ada penyimpanan lokal yang sedang/baru berjalan
     if (pendingWritesRef.current > 0 || lastLocalWriteRef.current >= startedAt) return;
+    if (Array.isArray(data.users) && data.users.length > 0) {
+      const next = data.users as User[];
+      setUsers((prev) => (JSON.stringify(prev) === JSON.stringify(next) ? prev : next));
+    }
     if (data.settings && data.settings.length > 0) {
       const next = sanitizeAttendanceSettings(data.settings[0]);
       setAttendanceSettings((prev) => (settingsEqual(prev, next) ? prev : next));
@@ -1897,8 +1942,22 @@ export default function App() {
   refreshDataRef.current = refreshData;
 
   const handleUsersUpdate = (newUsers: User[]) => {
+    // Hanya baris yang berubah yang dikirim (bukan menimpa seluruh sheet),
+    // supaya akun yang ditambah dari perangkat lain tidak ikut terhapus.
+    // Catatan: jangan pakai `new Map()` di file ini - nama Map sudah dipakai ikon lucide-react.
+    const oldById: Record<string, User> = {};
+    users.forEach((u) => { oldById[u.id] = u; });
+    const newIds = new Set(newUsers.map((u) => u.id));
+    const changed = newUsers.filter((u) => JSON.stringify(oldById[u.id]) !== JSON.stringify(u));
+    const removed = users.filter((u) => !newIds.has(u.id));
     setUsers(newUsers);
-    syncToDB('users', newUsers);
+    if (!GAS_API_URL) { syncToDB('users', newUsers); return; }
+    changed.forEach((u) => {
+      trackWrite(() => db.upsert('users', newUsers, u)).then((r) => { if (!r.ok) reportSaveFailure('users'); });
+    });
+    removed.forEach((u) => {
+      trackWrite(() => db.remove('users', u.id)).then((r) => { if (!r.ok) reportSaveFailure('users', 'menghapus'); });
+    });
   };
 
   const handleUpdateAttendanceSettings = async (newSettings: AttendanceSettings): Promise<SaveStatus> => {
@@ -2172,6 +2231,9 @@ export default function App() {
     };
   }, [user?.id]);
 
+  const outboxBanner = outbox.length > 0 && outboxError ? `Belum terkirim ke server: ${outboxError}. Data aman di HP ini dan dicoba lagi otomatis.` : null;
+  const bannerText = serverMsg || outboxBanner;
+
   if (!initialized) return <div className="min-h-screen flex items-center justify-center bg-slate-50 font-bold text-slate-500">Memuat Sistem...</div>;
 
   if (!user) {
@@ -2181,6 +2243,7 @@ export default function App() {
   if (user.role === 'admin' || user.role === 'owner') {
     return (
       <div className="min-h-screen bg-slate-50 flex flex-col md:flex-row">
+        {bannerText && <div className="fixed top-0 left-0 right-0 z-[998] bg-amber-500 text-white text-xs font-medium px-4 py-2 text-center">{bannerText}</div>}
         {syncError && (
           <div className="fixed bottom-20 md:bottom-4 left-1/2 -translate-x-1/2 z-[999] bg-red-600 text-white text-xs font-medium px-4 py-2 rounded-full shadow-lg max-w-[90%] text-center">
             {syncError}
@@ -2298,6 +2361,8 @@ export default function App() {
             </button>
           </div>
         </header>
+
+        {bannerText && <div className="bg-amber-50 text-amber-800 text-xs font-medium px-4 py-2 border-b border-amber-200">{bannerText}</div>}
 
         <main className="flex-1 overflow-y-auto bg-slate-50">
           {currentTab === 'home' && (
