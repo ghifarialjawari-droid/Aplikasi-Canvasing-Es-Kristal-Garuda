@@ -529,9 +529,9 @@ const LoginScreen = ({ onLogin, users }: { onLogin: (u: User) => void, users: Us
 };
 
 const PegawaiDashboard = ({
-  user, visits, attendanceToday, onCheckIn, onCheckOut, attendanceLoading, attendanceSettings, targets, attendanceLoaded, attendancePending
+  user, visits, attendance, attendanceToday, onCheckIn, onCheckOut, attendanceLoading, attendanceSettings, targets, attendanceLoaded, attendancePending
 }: {
-  user: User, visits: Visit[], attendanceToday: Attendance | null,
+  user: User, visits: Visit[], attendance: Attendance[], attendanceToday: Attendance | null,
   onCheckIn: () => void, onCheckOut: () => void, attendanceLoading: boolean, attendanceSettings: AttendanceSettings, targets: Target[],
   attendanceLoaded: boolean, attendancePending: boolean
 }) => {
@@ -552,8 +552,18 @@ const PegawaiDashboard = ({
   const targetVisits = currentTarget.visits;
   const targetNew = currentTarget.newCustomers;
 
-  // Riwayat pencapaian bulan-bulan sebelumnya
-  const targetHistory = buildTargetHistory(user, myVisits, targets);
+  // Riwayat pencapaian: hanya 2 bulan terakhir
+  const targetHistory = buildTargetHistory(user, myVisits, targets, new Date(), 2);
+
+  // Rekap absensi bulan ini (satu catatan per hari; baris ganda dirapikan)
+  const myMonthDates = Array.from(new Set(
+    attendance.filter(a => a.pegawaiId === user.id && (a.date || '').slice(0, 7) === thisMonthStr).map(a => a.date)
+  ));
+  const myMonthRecords = myMonthDates
+    .map(d => pickDailyRecord(attendance, user.id, d))
+    .filter((r): r is Attendance => r !== null);
+  const onTimeCount = myMonthRecords.filter(r => r.status === 'Tepat Waktu').length;
+  const lateCount = myMonthRecords.filter(r => r.status === 'Terlambat').length;
 
   const progressVisits = targetVisits > 0 ? Math.min(100, Math.round((realisasiVisits / targetVisits) * 100)) : 0;
   const progressNew = targetNew > 0 ? Math.min(100, Math.round((realisasiNew / targetNew) * 100)) : 0;
@@ -571,7 +581,9 @@ const PegawaiDashboard = ({
       const startMinutes = timeToMinutes(attendanceSettings.checkInStart);
       const endMinutes = timeToMinutes(attendanceSettings.checkInEnd);
       if (nowMinutes < startMinutes) scheduleHint = `Absen masuk dibuka mulai pukul ${attendanceSettings.checkInStart}.`;
-      else if (nowMinutes > endMinutes) scheduleHint = `Absen masuk sudah ditutup (batas ${attendanceSettings.checkInEnd}).`;
+      else if (nowMinutes > endMinutes || nowMinutes > startMinutes + attendanceSettings.toleranceMinutes) {
+        scheduleHint = `Sudah lewat jam masuk. Anda tetap bisa absen, tetapi tercatat Terlambat.`;
+      }
     } else if (!attendanceToday.checkOutTime) {
       const startMinutes = timeToMinutes(attendanceSettings.checkOutStart);
       const endMinutes = timeToMinutes(attendanceSettings.checkOutEnd);
@@ -679,6 +691,21 @@ const PegawaiDashboard = ({
             <p className="mt-3 text-xs font-medium text-emerald-600 flex items-center gap-1"><CheckCircle size={12} /> Tersimpan di server</p>
           )
         )}
+      </Card>
+
+      <Card className="p-4">
+        <h3 className="font-bold text-slate-800 mb-3 flex items-center gap-2"><Clock size={18} className="text-blue-600" /> Rekap Absensi Bulan Ini</h3>
+        <div className="grid grid-cols-2 gap-3">
+          <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-100 text-center">
+            <span className="block text-2xl font-black text-emerald-700">{onTimeCount}</span>
+            <span className="text-xs font-medium text-emerald-700">Tepat Waktu</span>
+          </div>
+          <div className="p-3 rounded-xl bg-yellow-50 border border-yellow-100 text-center">
+            <span className="block text-2xl font-black text-yellow-700">{lateCount}</span>
+            <span className="text-xs font-medium text-yellow-700">Terlambat</span>
+          </div>
+        </div>
+        <p className="mt-2 text-[11px] text-slate-400 text-center">Total hadir {myMonthRecords.length} hari</p>
       </Card>
 
       <div className="grid grid-cols-2 gap-4">
@@ -2138,8 +2165,8 @@ export default function App() {
         alert(`Waktu absensi masuk belum dibuka. Absen masuk dibuka mulai pukul ${attendanceSettings.checkInStart}.`);
         return;
       }
-      if (nowMinutes > endMinutes) {
-        alert(`Waktu absensi masuk sudah ditutup (batas ${attendanceSettings.checkInEnd}). Hubungi Admin kalau ada kendala.`);
+      // Lewat batas jam masuk: tetap boleh absen, tetapi tercatat "Terlambat"
+      if (nowMinutes > endMinutes && !window.confirm(`Batas jam masuk (${attendanceSettings.checkInEnd}) sudah lewat. Absen tetap dicatat sebagai TERLAMBAT. Lanjutkan?`)) {
         return;
       }
     }
@@ -2167,7 +2194,8 @@ export default function App() {
         if (attendanceSettings.isActive) {
           const nowMinutes = now.getHours() * 60 + now.getMinutes();
           const startMinutes = timeToMinutes(attendanceSettings.checkInStart);
-          status = nowMinutes > startMinutes + attendanceSettings.toleranceMinutes ? 'Terlambat' : 'Tepat Waktu';
+          const endMinutes = timeToMinutes(attendanceSettings.checkInEnd);
+          status = (nowMinutes > startMinutes + attendanceSettings.toleranceMinutes || nowMinutes > endMinutes) ? 'Terlambat' : 'Tepat Waktu';
         }
         const newAtt: Attendance = {
           id: Date.now().toString(),
@@ -2388,6 +2416,7 @@ export default function App() {
           {currentTab === 'home' && (
             <PegawaiDashboard
               user={user} visits={visits}
+              attendance={attendance}
               attendanceToday={attendanceToday}
               onCheckIn={handleCheckIn}
               onCheckOut={handleCheckOut}
