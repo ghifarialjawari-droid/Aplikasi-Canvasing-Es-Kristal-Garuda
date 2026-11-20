@@ -60,7 +60,7 @@ const Select = ({ label, value, onChange, options }: any) => (
 const KNOWN_RADIUS_KM = 20; // daftar desa selalu diambil sampai radius terbesar, lalu disaring lokal
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-type KnownState = { state: 'loading' | 'ok' | 'error'; list: KnownVillage[] };
+type KnownState = { state: 'loading' | 'ok' | 'error'; list: KnownVillage[]; message?: string };
 
 const AdminMarket = ({ visits, users, onSaveGeo }: {
   visits: Visit[], users: User[], onSaveGeo?: (items: GeoUpdate[]) => void
@@ -81,6 +81,7 @@ const AdminMarket = ({ visits, users, onSaveGeo }: {
   const layerRef = useRef<L.LayerGroup | null>(null);
   const mountedRef = useRef(true);
   const runningRef = useRef(false);
+  const inflightRef = useRef<Set<string>>(new Set());
   const onSaveGeoRef = useRef(onSaveGeo);
   onSaveGeoRef.current = onSaveGeo;
   const visitsRef = useRef(visits);
@@ -171,14 +172,19 @@ const AdminMarket = ({ visits, users, onSaveGeo }: {
       for (const d of shownDepots) {
         if (cancelled) return;
         const cur = known[d.name];
-        if (cur && (cur.state === 'ok' || cur.state === 'loading')) continue;
+        if (cur && cur.state === 'ok') continue;
+        if (inflightRef.current.has(d.name)) continue;
+        inflightRef.current.add(d.name);
         setKnown(k => ({ ...k, [d.name]: { state: 'loading', list: [] } }));
         try {
           const list = await fetchVillagesAround(d.name, d.lat, d.lng, KNOWN_RADIUS_KM);
-          if (!cancelled) setKnown(k => ({ ...k, [d.name]: { state: 'ok', list } }));
-        } catch {
-          if (!cancelled) setKnown(k => ({ ...k, [d.name]: { state: 'error', list: [] } }));
+          if (mountedRef.current) setKnown(k => ({ ...k, [d.name]: { state: 'ok', list } }));
+        } catch (e) {
+          if (mountedRef.current) setKnown(k => ({ ...k, [d.name]: { state: 'error', list: [], message: e instanceof Error ? e.message : String(e) } }));
+        } finally {
+          inflightRef.current.delete(d.name);
         }
+        await sleep(1500); // jeda antar depot supaya tidak ditolak server
       }
     })();
     return () => { cancelled = true; };
@@ -385,7 +391,7 @@ const AdminMarket = ({ visits, users, onSaveGeo }: {
             {k && k.state === 'loading' && <p className="px-4 pt-3 text-xs text-slate-400 flex items-center gap-1"><RefreshCw size={12} className="animate-spin" /> Memuat daftar desa di sekitar depot...</p>}
             {k && k.state === 'error' && (
               <p className="px-4 pt-3 text-xs text-amber-700">
-                Daftar seluruh desa tidak dapat dimuat, jadi "belum dikunjungi" belum tersedia.{' '}
+                Daftar seluruh desa tidak dapat dimuat{k.message ? ` (${k.message})` : ''}, jadi "belum dikunjungi" belum tersedia.{' '}
                 <button className="font-semibold underline" onClick={() => { setKnown(s => { const n = { ...s }; delete n[a.depot.name]; return n; }); setKnownTick(x => x + 1); }}>Coba lagi</button>
               </p>
             )}
