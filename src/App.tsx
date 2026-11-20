@@ -20,6 +20,7 @@ const AdminDashboard = lazy(() => import('./admin/AdminDashboard'));
 const AdminMap = lazy(() => import('./admin/AdminMap'));
 const AdminTargets = lazy(() => import('./admin/AdminTargets'));
 const AdminReports = lazy(() => import('./admin/AdminReports'));
+const AdminMarket = lazy(() => import('./admin/AdminMarket'));
 
 // ==========================================
 // KONFIGURASI API GOOGLE APPS SCRIPT
@@ -35,7 +36,7 @@ const GAS_API_URL = "https://script.google.com/macros/s/AKfycbw1WM795b0RuqMkb81m
 const GAS_API_KEY = "";
 
 // Harus sama dengan CODE_VERSION di Code.gs. Kalau beda, aplikasi memberi peringatan.
-const EXPECTED_SERVER_VERSION = 'canvasing-v3';
+const EXPECTED_SERVER_VERSION = 'canvasing-v4';
 
 type Role = 'admin' | 'pegawai' | 'owner';
 
@@ -69,6 +70,8 @@ interface Visit {
   pegawaiId: string;
   area?: string;
   photo?: string; // base64 foto toko
+  desa?: string;      // desa/kelurahan hasil reverse geocoding GPS (diisi otomatis)
+  kecamatan?: string;
 }
 
 interface Attendance {
@@ -334,6 +337,23 @@ const db = {
       const res = await fetchWithRetry(GAS_API_URL, {
         method: 'POST',
         body: JSON.stringify({ action: 'delete', collection, id, key: GAS_API_KEY }),
+      });
+      const json = await res.json().catch(() => null);
+      if (!json) return { ok: false, error: 'Respons server tidak dapat dibaca' };
+      if (json.error) return { ok: false, error: String(json.error) };
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  },
+  // Mengisi kolom desa/kecamatan pada banyak kunjungan sekaligus (hasil reverse
+  // geocoding). Hanya dua kolom itu yang ditulis di server.
+  async patchGeo(items: { id: string, desa: string, kecamatan: string }[]): Promise<{ ok: boolean, error?: string }> {
+    if (!GAS_API_URL || items.length === 0) return { ok: true };
+    try {
+      const res = await fetchWithRetry(GAS_API_URL, {
+        method: 'POST',
+        body: JSON.stringify({ action: 'patchGeo', collection: 'visits', items, key: GAS_API_KEY }),
       });
       const json = await res.json().catch(() => null);
       if (!json) return { ok: false, error: 'Respons server tidak dapat dibaca' };
@@ -1737,7 +1757,7 @@ export default function App() {
   const [businessTypes, setBusinessTypes] = useState<string[]>(defaultBusinessTypes);
   const [attendanceSettings, setAttendanceSettings] = useState<AttendanceSettings>(defaultAttendanceSettings);
   const [currentTab, setCurrentTab] = useState<'home' | 'canvassing' | 'history' | 'customers' | 'map'>('home');
-  const [adminTab, setAdminTab] = useState<'dashboard' | 'map' | 'employees' | 'attendance' | 'reports' | 'canvasing' | 'customers'>('dashboard');
+  const [adminTab, setAdminTab] = useState<'dashboard' | 'map' | 'employees' | 'attendance' | 'reports' | 'canvasing' | 'customers' | 'market'>('dashboard');
   const [auditLogs, setAuditLogs] = useState<any[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [initialized, setInitialized] = useState(false);
@@ -2143,6 +2163,25 @@ export default function App() {
     queueWrite({ action: 'delete', collection: 'visits', itemId: visitId });
   };
 
+  // Menyimpan desa/kecamatan hasil reverse geocoding (Analisis Pasar). Memakai
+  // pembaruan berbasis state terbaru supaya tidak menimpa perubahan lain, dan
+  // hanya menulis dua kolom itu ke server (bukan seluruh baris kunjungan).
+  const handleSaveGeo = (items: { id: string, desa: string, kecamatan: string }[]) => {
+    if (items.length === 0) return;
+    // (catatan: `Map` di file ini adalah ikon lucide, jadi dipakai objek biasa)
+    const byId: Record<string, { id: string, desa: string, kecamatan: string }> = {};
+    items.forEach(i => { byId[i.id] = i; });
+    setVisits((prev) => {
+      const next = prev.map(v => {
+        const g = byId[v.id];
+        return g && !(v.desa && v.desa.trim()) ? { ...v, desa: g.desa, kecamatan: g.kecamatan } : v;
+      });
+      persistList('visits', next);
+      return next;
+    });
+    db.patchGeo(items).then(r => { if (!r.ok) console.error('Gagal menyimpan desa ke server:', r.error); });
+  };
+
   const todayStr = localDateStr();
   const attendanceToday = user ? pickDailyRecord(attendance, user.id, todayStr) : null;
   const attendancePending = !!user && outbox.some(o => o.collection === 'attendance' && o.action !== 'delete' && o.item && o.item.pegawaiId === user.id && o.item.date === todayStr);
@@ -2317,6 +2356,7 @@ export default function App() {
             <button onClick={() => setAdminTab('customers')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'customers' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><Database size={20} /> Data Customer</button>
             <button onClick={() => setAdminTab('attendance')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'attendance' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><Clock size={20} /> Absensi Karyawan</button>
             <button onClick={() => setAdminTab('reports')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'reports' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><FileText size={20} /> Laporan Bulanan</button>
+            <button onClick={() => setAdminTab('market')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'market' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><TrendingUp size={20} /> Analisis Pasar</button>
             <button onClick={() => setAdminTab('employees')} className={`flex items-center gap-3 w-full p-3 rounded-xl transition-colors text-left ${adminTab === 'employees' ? 'bg-blue-600 text-white shadow-md' : 'hover:bg-blue-600/50 text-blue-100'}`}><Users size={20} /> Kelola Akun Pegawai</button>
           </nav>
           <div className="p-4 hidden md:block border-t border-blue-600">
@@ -2338,7 +2378,8 @@ export default function App() {
           <Suspense fallback={<AdminSectionLoading />}>
             {adminTab === 'dashboard' && <AdminDashboard visits={visits} users={users} attendance={attendance} onRefresh={() => refreshDataRef.current(true)} lastSynced={lastSynced} />}
             {adminTab === 'map' && <AdminMap visits={visits} users={users} />}
-            {adminTab === 'reports' && <AdminReports visits={visits} users={users} targets={targets} />}
+            {adminTab === 'reports' && <AdminReports visits={visits} users={users} targets={targets} attendance={attendance} onEditVisit={handleEditVisit} />}
+            {adminTab === 'market' && <AdminMarket visits={visits} users={users} onSaveGeo={handleSaveGeo} />}
           </Suspense>
           {adminTab === 'attendance' && <AdminAttendance attendance={attendance} users={users} attendanceSettings={attendanceSettings} onUpdateSettings={handleUpdateAttendanceSettings} onRefresh={() => refreshDataRef.current(true)} lastSynced={lastSynced} />}
           {adminTab === 'employees' && <AdminEmployees users={users} setUsers={handleUsersUpdate} addAuditLog={addAuditLog} targets={targets} onUpdateTargets={handleUpdateTargets} businessTypes={businessTypes} onUpdateBusinessTypes={handleUpdateBusinessTypes} />}
@@ -2371,6 +2412,10 @@ export default function App() {
           <button onClick={() => setAdminTab('reports')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 min-w-[48px] transition-colors ${adminTab === 'reports' ? 'text-blue-600' : 'text-slate-400'}`}>
             <FileText size={20} />
             <span className="text-[9px] font-medium">Laporan</span>
+          </button>
+          <button onClick={() => setAdminTab('market')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 min-w-[48px] transition-colors ${adminTab === 'market' ? 'text-blue-600' : 'text-slate-400'}`}>
+            <TrendingUp size={20} />
+            <span className="text-[9px] font-medium">Pasar</span>
           </button>
           <button onClick={() => setAdminTab('employees')} className={`flex flex-col items-center gap-1 p-1.5 flex-1 min-w-[48px] transition-colors ${adminTab === 'employees' ? 'text-blue-600' : 'text-slate-400'}`}>
             <Users size={20} />
