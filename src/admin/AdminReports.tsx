@@ -1,10 +1,9 @@
-import React, { useState } from 'react';
-import { FileText, Printer, Award, TrendingUp, Building2 } from 'lucide-react';
-import { localDateStr } from '../lib/dates';
-import { getTargetForMonth, TargetEntry } from '../lib/targets';
-import {
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
-} from 'recharts';
+import React, { useState, useMemo } from 'react';
+import { FileText, Printer, Clock, MapPin, AlertTriangle, X, ExternalLink, Building2 } from 'lucide-react';
+import { localDateStr, localMonthStr, normalizeTimeStr } from '../lib/dates';
+import { pickDailyRecord } from '../lib/records';
+import { checkLocation, findInvalidVisits, parseLatLngText, getDepot, haversineKm } from '../lib/geo';
+import { monthLabel } from '../lib/targets';
 
 // Tipe data disalin dari App.tsx supaya file ini berdiri sendiri
 // (bisa di-lazy-load terpisah tanpa ikut menyeret komponen lain).
@@ -13,7 +12,6 @@ interface User {
   name: string;
   role: 'admin' | 'pegawai' | 'owner';
   cabang: string;
-  target: { visits: number; newCustomers: number };
   status?: 'Aktif' | 'Nonaktif';
 }
 
@@ -26,6 +24,19 @@ interface Visit {
   status: string;
   isNewCustomer: boolean;
   pegawaiId: string;
+  lat: number | null;
+  lng: number | null;
+  desa?: string;
+  kecamatan?: string;
+}
+
+interface Attendance {
+  id: string;
+  pegawaiId: string;
+  date: string;
+  checkInTime: string;
+  checkOutTime?: string;
+  status: string;
 }
 
 const Card = ({ children, className = '' }: { children: React.ReactNode, className?: string }) => (
@@ -64,289 +75,309 @@ const Select = ({ label, value, onChange, options }: any) => (
   </div>
 );
 
-type PeriodType = 'hari' | 'minggu' | 'bulan' | 'tahun';
+const minutesToHHmm = (m: number) => {
+  const t = Math.round(m);
+  const h = Math.floor(t / 60) % 24;
+  return `${h < 10 ? '0' : ''}${h}:${t % 60 < 10 ? '0' : ''}${t % 60}`;
+};
 
-// Menentukan rentang tanggal berdasarkan jenis periode & tanggal acuan
-function getRange(period: PeriodType, refDate: string): { start: string, end: string } {
-  const ref = new Date(refDate + 'T00:00:00');
-  if (period === 'hari') return { start: refDate, end: refDate };
-  if (period === 'minggu') {
-    const day = ref.getDay();
-    const diffToMonday = day === 0 ? -6 : 1 - day;
-    const monday = new Date(ref);
-    monday.setDate(ref.getDate() + diffToMonday);
-    const sunday = new Date(monday);
-    sunday.setDate(monday.getDate() + 6);
-    return { start: localDateStr(monday), end: localDateStr(sunday) };
-  }
-  if (period === 'bulan') {
-    const first = new Date(ref.getFullYear(), ref.getMonth(), 1);
-    const last = new Date(ref.getFullYear(), ref.getMonth() + 1, 0);
-    return { start: localDateStr(first), end: localDateStr(last) };
-  }
-  // tahun
-  const first = new Date(ref.getFullYear(), 0, 1);
-  const last = new Date(ref.getFullYear(), 11, 31);
-  return { start: localDateStr(first), end: localDateStr(last) };
-}
+const rawCoord = (v: unknown) => (v === null || v === undefined || (typeof v === 'number' && !isFinite(v)) ? '-' : String(v));
 
-const AdminReports = ({ visits, users, targets }: { visits: Visit[], users: User[], targets: TargetEntry[] }) => {
-  const todayStr = localDateStr();
-  const [reportType, setReportType] = useState<'depot' | 'semua'>('depot');
-  const [period, setPeriod] = useState<PeriodType>('bulan');
-  const [refDate, setRefDate] = useState(todayStr);
-  const [selectedCabangRaw, setSelectedCabang] = useState('');
-  const [selectedPegawai, setSelectedPegawai] = useState('Semua');
+// ---------- Form perbaikan lokasi (admin) ----------
+const FixLocationModal = ({ visit, onClose, onSave }: {
+  visit: Visit, onClose: () => void, onSave: (lat: number, lng: number) => void
+}) => {
+  const [latText, setLatText] = useState(visit.lat === null || visit.lat === undefined || !isFinite(Number(visit.lat)) ? '' : String(visit.lat));
+  const [lngText, setLngText] = useState(visit.lng === null || visit.lng === undefined || !isFinite(Number(visit.lng)) ? '' : String(visit.lng));
+  const [pasteText, setPasteText] = useState('');
 
-  const cabangList = Array.from(new Set(users.filter(u => u.role === 'pegawai').map(u => u.cabang)));
-  const selectedCabang = selectedCabangRaw || cabangList[0] || '';
+  const check = checkLocation(latText, lngText);
+  const depot = getDepot(visit.cabang);
+  const distKm = check.valid && depot ? haversineKm(depot.lat, depot.lng, check.lat as number, check.lng as number) : null;
 
-  const { start, end } = getRange(period, refDate);
-
-  // Target per pegawai mengikuti menu Target Canvasing (bukan angka bawaan akun).
-  // Periode tahunan = jumlah target 12 bulan; periode lain memakai target bulan acuan.
-  const targetOf = (u: User): number => {
-    const year = refDate.slice(0, 4);
-    if (period === 'tahun') {
-      let total = 0;
-      for (let m = 1; m <= 12; m++) total += getTargetForMonth(u, targets, `${year}-${m < 10 ? '0' : ''}${m}`).visits;
-      return total;
-    }
-    return getTargetForMonth(u, targets, refDate.slice(0, 7)).visits;
+  const applyPaste = (text: string) => {
+    setPasteText(text);
+    const p = parseLatLngText(text);
+    if (p) { setLatText(String(p.lat)); setLngText(String(p.lng)); }
   };
-  const periodVisits = visits.filter(v => v.date >= start && v.date <= end);
 
-  // ---------- LAPORAN PER DEPOT ----------
-  const depotVisits = periodVisits.filter(v => v.cabang === selectedCabang);
-  const pegawaiDepot = users.filter(u => u.role === 'pegawai' && u.cabang === selectedCabang);
-  const pegawaiFilterList = ['Semua', ...pegawaiDepot.map(u => u.name)];
-  const depotVisitsFiltered = selectedPegawai === 'Semua' ? depotVisits : depotVisits.filter(v => {
-    const peg = users.find(u => u.id === v.pegawaiId);
-    return peg?.name === selectedPegawai;
-  });
+  const inputCls = "w-full bg-slate-50 border border-slate-200 text-slate-800 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white";
 
-  const totalKunjunganDepot = depotVisitsFiltered.length;
-  const customerBaruDepot = depotVisitsFiltered.filter(v => v.isNewCustomer).length;
-  const customerLamaDepot = totalKunjunganDepot - customerBaruDepot;
-  const targetDepot = pegawaiDepot.reduce((sum, u) => sum + targetOf(u), 0);
-  const pctDepot = targetDepot > 0 ? Math.min(100, Math.round((totalKunjunganDepot / targetDepot) * 100)) : 0;
+  return (
+    <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[600] flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-[90vh] overflow-y-auto p-5" onClick={(e) => e.stopPropagation()}>
+        <div className="flex justify-between items-start mb-4">
+          <div>
+            <h3 className="font-bold text-slate-800 text-lg">Perbaiki Lokasi</h3>
+            <p className="text-xs text-slate-500">{visit.shopName} - {visit.cabang} - {visit.date}</p>
+          </div>
+          <button onClick={onClose} className="p-1 bg-slate-100 rounded-full hover:bg-slate-200"><X size={16} /></button>
+        </div>
 
-  const rankingDepot = pegawaiDepot.map(u => {
-    const uv = depotVisits.filter(v => v.pegawaiId === u.id);
-    return { name: u.name, visits: uv.length, tokoBaru: uv.filter(v => v.isNewCustomer).length };
-  }).sort((a, b) => b.visits - a.visits);
+        <div className="space-y-3">
+          <div>
+            <label className="block text-sm font-medium text-slate-600 mb-1.5">Tempel koordinat dari Google Maps (opsional)</label>
+            <input value={pasteText} onChange={(e) => applyPaste(e.target.value)} placeholder="-7.0346, 107.9826" className={inputCls} />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-sm font-medium text-slate-600 mb-1.5">Latitude</label>
+              <input value={latText} onChange={(e) => setLatText(e.target.value)} inputMode="decimal" placeholder="-7.xxxxx" className={inputCls} />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-600 mb-1.5">Longitude</label>
+              <input value={lngText} onChange={(e) => setLngText(e.target.value)} inputMode="decimal" placeholder="107.xxxxx" className={inputCls} />
+            </div>
+          </div>
+          <button type="button" onClick={() => { const a = latText; setLatText(lngText); setLngText(a); }} className="text-xs font-semibold text-blue-600 hover:text-blue-700">
+            Tukar Latitude / Longitude
+          </button>
 
-  const dayNames = ['Min', 'Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab'];
-  const grafikHarianDepot: { name: string, kunjungan: number }[] = [];
-  {
-    const startD = new Date(start + 'T00:00:00');
-    const endD = new Date(end + 'T00:00:00');
-    const diffDays = Math.min(31, Math.round((endD.getTime() - startD.getTime()) / 86400000) + 1);
-    for (let i = 0; i < diffDays; i++) {
-      const d = new Date(startD);
-      d.setDate(startD.getDate() + i);
-      const dateStr = localDateStr(d);
-      grafikHarianDepot.push({
-        name: `${d.getDate()} ${dayNames[d.getDay()]}`,
-        kunjungan: depotVisits.filter(v => v.date === dateStr).length,
-      });
-    }
-  }
+          <div className={`text-sm rounded-xl p-3 border ${check.valid ? 'bg-emerald-50 border-emerald-100 text-emerald-700' : 'bg-red-50 border-red-100 text-red-700'}`}>
+            {check.valid
+              ? <>Koordinat valid.{distKm !== null && <> Jarak ke depot {visit.cabang}: <b>{distKm.toFixed(1)} km</b>.</>}</>
+              : <>{check.message || 'Koordinat belum diisi.'}</>}
+          </div>
 
-  // ---------- LAPORAN SEMUA DEPOT ----------
-  const rankingSemuaDepot = cabangList.map((c) => {
-    const cv = periodVisits.filter(v => v.cabang === c);
-    const pegawaiC = users.filter(u => u.role === 'pegawai' && u.cabang === c);
-    const targetC = pegawaiC.reduce((sum, u) => sum + targetOf(u), 0);
-    return {
-      cabang: c,
-      visits: cv.length,
-      tokoBaru: cv.filter(v => v.isNewCustomer).length,
-      target: targetC,
-      pct: targetC > 0 ? Math.round((cv.length / targetC) * 100) : 0,
-    };
-  }).sort((a, b) => b.visits - a.visits);
+          <div className="flex gap-2 pt-1">
+            <Button variant="outline" className="py-2 text-sm" disabled={!check.valid}
+              onClick={() => check.valid && window.open(`https://www.google.com/maps?q=${check.lat},${check.lng}`, '_blank', 'noopener,noreferrer')}>
+              <ExternalLink size={14} /> Cek di Maps
+            </Button>
+            <Button className="py-2 text-sm" disabled={!check.valid} onClick={() => check.valid && onSave(check.lat as number, check.lng as number)}>
+              Simpan
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
 
-  const depotTerbaikSemua = rankingSemuaDepot[0];
-  const totalKunjunganSemua = rankingSemuaDepot.reduce((s, d) => s + d.visits, 0);
-  const totalTargetSemua = rankingSemuaDepot.reduce((s, d) => s + d.target, 0);
+const AdminReports = ({ visits, users, attendance, onEditVisit }: {
+  visits: Visit[], users: User[], targets?: unknown, attendance?: Attendance[],
+  onEditVisit?: (id: string, updates: Partial<Visit>) => void
+}) => {
+  const [month, setMonth] = useState(localMonthStr());
+  const [selectedCabang, setSelectedCabang] = useState('Semua');
+  const [fixing, setFixing] = useState<Visit | null>(null);
+  const [notice, setNotice] = useState('');
 
-  let pegawaiTerbaikSemua: { name: string, cabang: string, visits: number } | null = null;
-  users.filter(u => u.role === 'pegawai').forEach((u) => {
-    const uv = periodVisits.filter(v => v.pegawaiId === u.id).length;
-    if (!pegawaiTerbaikSemua || uv > pegawaiTerbaikSemua.visits) {
-      pegawaiTerbaikSemua = { name: u.name, cabang: u.cabang, visits: uv };
-    }
-  });
+  const attList: Attendance[] = attendance || [];
+  const cabangList = useMemo(() => Array.from(new Set(users.filter(u => u.role === 'pegawai').map(u => u.cabang))), [users]);
+  const depotRows = selectedCabang === 'Semua' ? cabangList : [selectedCabang];
+
+  // ---------- Jumlah data canvasing ----------
+  const monthVisits = useMemo(() => visits.filter(v => String(v.date).slice(0, 7) === month), [visits, month]);
+  const visitsByDepot = depotRows.map(c => ({ cabang: c, count: monthVisits.filter(v => v.cabang === c).length }));
+  const totalVisits = visitsByDepot.reduce((s, r) => s + r.count, 0);
+
+  // ---------- Absensi ----------
+  const pegawaiScope = users.filter(u => u.role === 'pegawai' && (selectedCabang === 'Semua' || u.cabang === selectedCabang));
+  const attendanceRows = useMemo(() => {
+    const monthAtt = attList.filter(a => String(a.date).slice(0, 7) === month);
+    return pegawaiScope.map(u => {
+      const dates = Array.from(new Set(monthAtt.filter(a => a.pegawaiId === u.id).map(a => a.date)));
+      // satu catatan per hari (baris ganda dari dua HP dirapikan)
+      const recs = dates.map(d => pickDailyRecord(monthAtt, u.id, d)).filter((r): r is Attendance => r !== null);
+      const tepat = recs.filter(r => r.status === 'Tepat Waktu').length;
+      const terlambat = recs.filter(r => r.status === 'Terlambat').length;
+      const mins = recs
+        .map(r => normalizeTimeStr(r.checkInTime))
+        .filter((t): t is string => !!t)
+        .map(t => { const [h, m] = t.split(':').map(Number); return h * 60 + m; });
+      const avg = mins.length ? mins.reduce((s, x) => s + x, 0) / mins.length : null;
+      return { id: u.id, name: u.name, cabang: u.cabang, hadir: recs.length, tepat, terlambat, avgMin: avg, sumMin: mins.reduce((s, x) => s + x, 0), nMin: mins.length };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [attList, month, selectedCabang, users]);
+  const totalTepat = attendanceRows.reduce((s, r) => s + r.tepat, 0);
+  const totalTerlambat = attendanceRows.reduce((s, r) => s + r.terlambat, 0);
+  const sumMin = attendanceRows.reduce((s, r) => s + r.sumMin, 0);
+  const nMin = attendanceRows.reduce((s, r) => s + r.nMin, 0);
+  const avgMasukAll = nMin ? minutesToHHmm(sumMin / nMin) : '-';
+
+  // ---------- Lokasi tidak valid ----------
+  const scopedVisits = useMemo(
+    () => monthVisits.filter(v => selectedCabang === 'Semua' || v.cabang === selectedCabang),
+    [monthVisits, selectedCabang]
+  );
+  const invalidList = useMemo(() => findInvalidVisits(scopedVisits), [scopedVisits]);
+  const invalidAllTime = useMemo(() => findInvalidVisits(visits).length, [visits]);
+
+  const handleSaveFix = (lat: number, lng: number) => {
+    if (!fixing || !onEditVisit) return;
+    // desa/kecamatan dikosongkan agar dikenali ulang dari koordinat yang baru
+    onEditVisit(fixing.id, { lat, lng, desa: '', kecamatan: '' });
+    setNotice(`Lokasi "${fixing.shopName}" diperbaiki.`);
+    setFixing(null);
+    setTimeout(() => setNotice(''), 3500);
+  };
 
   const handleExportCSV = () => {
-    let headers: string[];
-    let rows: string[][];
-    if (reportType === 'depot') {
-      headers = ['Nama Pegawai', 'Kunjungan', 'Toko Baru'];
-      rows = rankingDepot.map(r => [r.name, String(r.visits), String(r.tokoBaru)]);
-    } else {
-      headers = ['Cabang/Depot', 'Kunjungan', 'Toko Baru', 'Target', 'Persentase'];
-      rows = rankingSemuaDepot.map(r => [r.cabang, String(r.visits), String(r.tokoBaru), String(r.target), `${r.pct}%`]);
-    }
-    const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
-    const blob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
+    const q = (s: string) => `"${String(s).replace(/"/g, '""')}"`;
+    const lines: string[] = [];
+    lines.push(['Laporan Bulanan', monthLabel(month), selectedCabang].map(q).join(','));
+    lines.push('');
+    lines.push(['Depot', 'Jumlah Canvasing'].map(q).join(','));
+    visitsByDepot.forEach(r => lines.push([q(r.cabang), r.count].join(',')));
+    lines.push([q('Total'), totalVisits].join(','));
+    lines.push('');
+    lines.push(['Pegawai', 'Depot', 'Hadir', 'Tepat Waktu', 'Terlambat', 'Rata-rata Jam Masuk'].map(q).join(','));
+    attendanceRows.forEach(r => lines.push([q(r.name), q(r.cabang), r.hadir, r.tepat, r.terlambat, q(r.avgMin === null ? '-' : minutesToHHmm(r.avgMin))].join(',')));
+    lines.push('');
+    lines.push([q('Lokasi Tidak Valid'), invalidList.length].join(','));
+    invalidList.forEach(({ visit, check }) => lines.push([q(visit.date), q(visit.shopName), q(visit.cabang), q(check.message || '')].join(',')));
+    const blob = new Blob(['\uFEFF' + lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `laporan-${reportType}-${start}-${end}.csv`;
+    link.download = `laporan-bulanan-${month}.csv`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
   };
 
-  const handlePrint = () => window.print();
-
   return (
     <div className="p-6 md:p-8 space-y-6 bg-slate-50 min-h-screen">
       <div className="flex flex-col sm:flex-row justify-between sm:items-center gap-4 print:hidden">
         <div>
           <h1 className="text-2xl md:text-3xl font-bold text-slate-800">Laporan Bulanan</h1>
-          <p className="text-slate-500">Ringkasan performa canvasing per depot maupun seluruh depot.</p>
+          <p className="text-slate-500">Canvasing, absensi, dan kualitas data lokasi per bulan.</p>
         </div>
         <div className="flex gap-2">
           <Button variant="outline" className="py-2 w-auto px-4" onClick={handleExportCSV}><FileText size={16} /> Export Excel (CSV)</Button>
-          <Button variant="outline" className="py-2 w-auto px-4" onClick={handlePrint}><Printer size={16} /> Print / PDF</Button>
+          <Button variant="outline" className="py-2 w-auto px-4" onClick={() => window.print()}><Printer size={16} /> Print / PDF</Button>
         </div>
-      </div>
-
-      <div className="flex gap-2 bg-slate-100 p-1 rounded-xl w-fit print:hidden">
-        <button onClick={() => setReportType('depot')} className={`px-4 py-2 rounded-lg text-sm font-semibold ${reportType === 'depot' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500'}`}>Laporan Per Depot</button>
-        <button onClick={() => setReportType('semua')} className={`px-4 py-2 rounded-lg text-sm font-semibold ${reportType === 'semua' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500'}`}>Laporan Semua Depot</button>
       </div>
 
       <Card className="p-5 print:hidden">
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-          <Select label="Periode" value={period} onChange={(e: any) => setPeriod(e.target.value)} options={[{ value: 'hari', label: 'Harian' }, { value: 'minggu', label: 'Mingguan' }, { value: 'bulan', label: 'Bulanan' }, { value: 'tahun', label: 'Tahunan' }]} />
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
-            <label className="block text-sm font-medium text-slate-600 mb-1.5">Tanggal Acuan</label>
-            <input type="date" value={refDate} onChange={(e) => setRefDate(e.target.value)} className="w-full bg-slate-50 border border-slate-200 text-slate-800 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            <label className="block text-sm font-medium text-slate-600 mb-1.5">Bulan</label>
+            <input type="month" value={month} onChange={(e) => setMonth(e.target.value || localMonthStr())} max={localDateStr().slice(0, 7)} className="w-full bg-slate-50 border border-slate-200 text-slate-800 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500" />
           </div>
-          {reportType === 'depot' && (
-            <>
-              <Select label="Depot/Cabang" value={selectedCabang} onChange={(e: any) => { setSelectedCabang(e.target.value); setSelectedPegawai('Semua'); }} options={cabangList} />
-              <Select label="Pegawai" value={selectedPegawai} onChange={(e: any) => setSelectedPegawai(e.target.value)} options={pegawaiFilterList} />
-            </>
-          )}
+          <Select label="Depot/Cabang" value={selectedCabang} onChange={(e: any) => setSelectedCabang(e.target.value)} options={['Semua', ...cabangList]} />
         </div>
-        <p className="text-xs text-slate-400 mt-3">Menampilkan data dari {start} sampai {end}</p>
+        <p className="text-xs text-slate-400 mt-3">Menampilkan data {monthLabel(month)}{selectedCabang !== 'Semua' ? ` - depot ${selectedCabang}` : ' - semua depot'}</p>
       </Card>
 
-      {reportType === 'depot' ? (
-        <>
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
-            <Card className="p-6 border-l-4 border-l-blue-500">
-              <p className="text-slate-500 text-sm font-medium">Total Kunjungan</p>
-              <p className="text-3xl font-black text-slate-800 mt-2">{totalKunjunganDepot}</p>
-            </Card>
-            <Card className="p-6 border-l-4 border-l-emerald-500">
-              <p className="text-slate-500 text-sm font-medium">Customer Baru</p>
-              <p className="text-3xl font-black text-slate-800 mt-2">{customerBaruDepot}</p>
-            </Card>
-            <Card className="p-6 border-l-4 border-l-indigo-500">
-              <p className="text-slate-500 text-sm font-medium">Customer Lama</p>
-              <p className="text-3xl font-black text-slate-800 mt-2">{customerLamaDepot}</p>
-            </Card>
-            <Card className="p-6 border-l-4 border-l-purple-500">
-              <p className="text-slate-500 text-sm font-medium">Target / Realisasi</p>
-              <p className="text-2xl font-black text-slate-800 mt-2">{totalKunjunganDepot}/{targetDepot} <span className="text-sm text-slate-400">({pctDepot}%)</span></p>
-            </Card>
+      {notice && <div className="bg-emerald-50 border border-emerald-100 text-emerald-700 text-sm rounded-xl px-4 py-3 print:hidden">{notice}</div>}
+
+      {/* JUMLAH DATA CANVASING */}
+      <div>
+        <h2 className="font-bold text-slate-800 text-lg mb-3 flex items-center gap-2"><Building2 size={20} className="text-blue-600" /> Jumlah Data Canvasing</h2>
+        <Card className="p-0">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm whitespace-nowrap">
+              <thead className="bg-slate-100 text-slate-600 font-medium">
+                <tr><th className="p-3">Depot/Cabang</th><th className="p-3 text-right">Jumlah Canvasing</th></tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {visitsByDepot.map(r => (
+                  <tr key={r.cabang}><td className="p-3 font-semibold text-slate-800">{r.cabang}</td><td className="p-3 text-right">{r.count}</td></tr>
+                ))}
+                {visitsByDepot.length === 0 && <tr><td colSpan={2} className="p-6 text-center text-slate-400">Belum ada depot.</td></tr>}
+              </tbody>
+              <tfoot className="bg-blue-50 text-blue-800 font-bold">
+                <tr><td className="p-3">Total {selectedCabang === 'Semua' ? 'Seluruh Depot' : selectedCabang}</td><td className="p-3 text-right">{totalVisits}</td></tr>
+              </tfoot>
+            </table>
           </div>
+        </Card>
+      </div>
 
-          <Card className="p-6">
-            <h3 className="font-bold text-slate-800 mb-6 text-lg">Grafik Kunjungan Harian</h3>
-            <div className="h-64">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={grafikHarianDepot}>
-                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-                  <XAxis dataKey="name" axisLine={false} tickLine={false} interval={Math.ceil(grafikHarianDepot.length / 10)} />
-                  <YAxis axisLine={false} tickLine={false} allowDecimals={false} />
-                  <Tooltip cursor={{ fill: '#f1f5f9' }} />
-                  <Bar dataKey="kunjungan" fill="#2563eb" radius={[4, 4, 0, 0]} name="Kunjungan" />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
+      {/* ABSENSI */}
+      <div>
+        <h2 className="font-bold text-slate-800 text-lg mb-3 flex items-center gap-2"><Clock size={20} className="text-blue-600" /> Absensi Karyawan</h2>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
+          <Card className="p-6 border-l-4 border-l-emerald-500">
+            <p className="text-slate-500 text-sm font-medium">Tepat Waktu</p>
+            <p className="text-3xl font-black text-slate-800 mt-2">{totalTepat}</p>
           </Card>
-
-          <Card className="p-6">
-            <h3 className="font-bold text-slate-800 mb-6 text-lg flex items-center gap-2"><TrendingUp className="text-blue-500" /> Ranking Pegawai - {selectedCabang}</h3>
-            <div className="space-y-3">
-              {rankingDepot.map((r, i) => (
-                <div key={i} className="flex items-center justify-between p-3 rounded-xl bg-slate-50 border border-slate-100">
-                  <div className="flex items-center gap-3">
-                    <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm ${i === 0 ? 'bg-yellow-100 text-yellow-600' : 'bg-slate-200 text-slate-600'}`}>#{i + 1}</div>
-                    <p className="font-semibold text-slate-800 text-sm">{r.name}</p>
-                  </div>
-                  <div className="text-right">
-                    <p className="font-bold text-blue-600">{r.visits} Kunjungan</p>
-                    <p className="text-xs text-emerald-600 font-medium">+{r.tokoBaru} Toko Baru</p>
-                  </div>
-                </div>
-              ))}
-              {rankingDepot.length === 0 && <p className="text-sm text-slate-400 text-center py-4">Belum ada pegawai di depot ini.</p>}
-            </div>
+          <Card className="p-6 border-l-4 border-l-yellow-500">
+            <p className="text-slate-500 text-sm font-medium">Terlambat</p>
+            <p className="text-3xl font-black text-slate-800 mt-2">{totalTerlambat}</p>
           </Card>
-        </>
-      ) : (
-        <>
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
-            <Card className="p-6 border-l-4 border-l-blue-500">
-              <p className="text-slate-500 text-sm font-medium">Total Kunjungan (Semua)</p>
-              <p className="text-3xl font-black text-slate-800 mt-2">{totalKunjunganSemua}</p>
-            </Card>
-            <Card className="p-6 border-l-4 border-l-purple-500">
-              <p className="text-slate-500 text-sm font-medium">Total Target</p>
-              <p className="text-3xl font-black text-slate-800 mt-2">{totalTargetSemua}</p>
-            </Card>
-            <Card className="p-6 border-l-4 border-l-emerald-500">
-              <p className="text-slate-500 text-sm font-medium flex items-center gap-1"><Award size={14} /> Depot Terbaik</p>
-              <p className="text-lg font-black text-slate-800 mt-2 truncate">{depotTerbaikSemua ? `${depotTerbaikSemua.cabang} (${depotTerbaikSemua.visits})` : '-'}</p>
-            </Card>
-            <Card className="p-6 border-l-4 border-l-yellow-500">
-              <p className="text-slate-500 text-sm font-medium flex items-center gap-1"><Award size={14} /> Pegawai Terbaik</p>
-              <p className="text-lg font-black text-slate-800 mt-2 truncate">{pegawaiTerbaikSemua ? `${(pegawaiTerbaikSemua as any).name}` : '-'}</p>
-            </Card>
-          </div>
-
-          <Card className="p-6">
-            <h3 className="font-bold text-slate-800 mb-6 text-lg flex items-center gap-2"><Building2 className="text-blue-500" /> Ranking Depot</h3>
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-sm whitespace-nowrap">
-                <thead className="bg-slate-100 text-slate-600 font-medium">
-                  <tr>
-                    <th className="p-3">#</th>
-                    <th className="p-3">Depot/Cabang</th>
-                    <th className="p-3">Kunjungan</th>
-                    <th className="p-3">Toko Baru</th>
-                    <th className="p-3">Target</th>
-                    <th className="p-3">Persentase</th>
+          <Card className="p-6 border-l-4 border-l-blue-500">
+            <p className="text-slate-500 text-sm font-medium">Rata-rata Jam Masuk</p>
+            <p className="text-3xl font-black text-slate-800 mt-2">{avgMasukAll}</p>
+          </Card>
+        </div>
+        <Card className="p-0">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm whitespace-nowrap">
+              <thead className="bg-slate-100 text-slate-600 font-medium">
+                <tr>
+                  <th className="p-3">Pegawai</th><th className="p-3">Depot</th>
+                  <th className="p-3 text-right">Hadir</th><th className="p-3 text-right">Tepat Waktu</th>
+                  <th className="p-3 text-right">Terlambat</th><th className="p-3 text-right">Rata-rata Jam Masuk</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {attendanceRows.map(r => (
+                  <tr key={r.id}>
+                    <td className="p-3 font-semibold text-slate-800">{r.name}</td>
+                    <td className="p-3 text-slate-600">{r.cabang}</td>
+                    <td className="p-3 text-right">{r.hadir}</td>
+                    <td className="p-3 text-right text-emerald-600 font-medium">{r.tepat}</td>
+                    <td className="p-3 text-right text-yellow-600 font-medium">{r.terlambat}</td>
+                    <td className="p-3 text-right">{r.avgMin === null ? '-' : minutesToHHmm(r.avgMin)}</td>
                   </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {rankingSemuaDepot.map((r, i) => (
-                    <tr key={r.cabang}>
-                      <td className="p-3 font-bold text-slate-400">#{i + 1}</td>
-                      <td className="p-3 font-semibold text-slate-800">{r.cabang}</td>
-                      <td className="p-3">{r.visits}</td>
-                      <td className="p-3 text-emerald-600 font-medium">+{r.tokoBaru}</td>
-                      <td className="p-3">{r.target}</td>
-                      <td className="p-3">
-                        <span className={`px-2 py-1 rounded-full text-xs font-bold ${r.pct >= 100 ? 'bg-emerald-100 text-emerald-700' : r.pct >= 70 ? 'bg-yellow-100 text-yellow-700' : 'bg-red-100 text-red-700'}`}>{r.pct}%</span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                ))}
+                {attendanceRows.length === 0 && <tr><td colSpan={6} className="p-6 text-center text-slate-400">Belum ada pegawai.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      </div>
+
+      {/* LOKASI TIDAK VALID */}
+      <div>
+        <h2 className="font-bold text-slate-800 text-lg mb-3 flex items-center gap-2"><MapPin size={20} className="text-blue-600" /> Lokasi Tidak Valid</h2>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+          <Card className="p-6 border-l-4 border-l-red-500">
+            <p className="text-slate-500 text-sm font-medium flex items-center gap-1"><AlertTriangle size={14} /> Bulan & depot ini</p>
+            <p className="text-3xl font-black text-slate-800 mt-2">{invalidList.length}</p>
           </Card>
-        </>
-      )}
+          <Card className="p-6 border-l-4 border-l-slate-400">
+            <p className="text-slate-500 text-sm font-medium">Seluruh waktu & depot</p>
+            <p className="text-3xl font-black text-slate-800 mt-2">{invalidAllTime}</p>
+          </Card>
+        </div>
+        <p className="text-xs text-slate-400 mb-3">Data ini tidak dihapus, hanya tidak ikut perhitungan radius dan peta sampai lokasinya diperbaiki.</p>
+        <Card className="p-0">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm whitespace-nowrap">
+              <thead className="bg-slate-100 text-slate-600 font-medium">
+                <tr>
+                  <th className="p-3">Tanggal</th><th className="p-3">Nama Toko</th><th className="p-3">Depot</th><th className="p-3">Sales</th>
+                  <th className="p-3">Lat / Lng</th><th className="p-3">Masalah</th><th className="p-3 text-center print:hidden">Aksi</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {invalidList.map(({ visit, check }) => (
+                  <tr key={visit.id} className="hover:bg-slate-50">
+                    <td className="p-3 text-slate-500">{visit.date}</td>
+                    <td className="p-3 font-semibold text-slate-800">{visit.shopName}</td>
+                    <td className="p-3 text-slate-600">{visit.cabang}</td>
+                    <td className="p-3 text-slate-600">{users.find(u => u.id === visit.pegawaiId)?.name || '-'}</td>
+                    <td className="p-3 text-slate-500">{rawCoord(visit.lat)} / {rawCoord(visit.lng)}</td>
+                    <td className="p-3"><span className="px-2 py-1 rounded-full text-xs font-bold bg-red-100 text-red-700">Lokasi Tidak Valid</span> <span className="text-xs text-slate-400">{check.message}</span></td>
+                    <td className="p-3 text-center print:hidden">
+                      {onEditVisit && <button onClick={() => setFixing(visit)} className="px-3 py-1.5 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 text-xs font-semibold">Perbaiki</button>}
+                    </td>
+                  </tr>
+                ))}
+                {invalidList.length === 0 && <tr><td colSpan={7} className="p-6 text-center text-slate-400">Tidak ada lokasi tidak valid pada bulan & depot ini.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      </div>
+
+      {fixing && <FixLocationModal visit={fixing} onClose={() => setFixing(null)} onSave={handleSaveFix} />}
     </div>
   );
 };

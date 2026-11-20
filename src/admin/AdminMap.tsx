@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { MapPin, X, ExternalLink, Image as ImageIcon } from 'lucide-react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
+import { isValidCoord, parseCoord } from '../lib/geo';
 
 // Tipe data disalin dari App.tsx supaya file ini berdiri sendiri
 // (bisa di-lazy-load terpisah tanpa ikut menyeret komponen lain).
@@ -113,7 +114,7 @@ const AdminMap = ({ visits, users, restrictCabang }: { visits: Visit[], users: U
     } else if (filterCabang !== 'Semua' && peg?.cabang !== filterCabang) return false;
     if (filterPegawai !== 'Semua' && peg?.name !== filterPegawai) return false;
     if (filterStatus !== 'Semua' && v.status !== filterStatus) return false;
-    return v.lat !== null && v.lng !== null;
+    return isValidCoord(v.lat, v.lng); // lokasi tidak valid tidak ikut peta
   });
 
   // Inisialisasi peta sekali saat komponen pertama kali muncul
@@ -147,14 +148,14 @@ const AdminMap = ({ visits, users, restrictCabang }: { visits: Visit[], users: U
         iconSize: [18, 18],
         iconAnchor: [9, 9],
       });
-      const marker = L.marker([v.lat as number, v.lng as number], { icon }).addTo(map);
+      const marker = L.marker([parseCoord(v.lat) as number, parseCoord(v.lng) as number], { icon }).addTo(map);
       marker.bindTooltip(v.shopName, { direction: 'top', offset: [0, -8] });
       marker.on('click', () => setSelectedMarker(v));
       markersRef.current.push(marker);
     });
 
     if (filteredVisits.length > 0) {
-      const bounds = L.latLngBounds(filteredVisits.map(v => [v.lat as number, v.lng as number]));
+      const bounds = L.latLngBounds(filteredVisits.map(v => [parseCoord(v.lat) as number, parseCoord(v.lng) as number]));
       map.fitBounds(bounds, { padding: [40, 40], maxZoom: 15 });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
