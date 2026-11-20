@@ -4,7 +4,7 @@
 // sehingga hasilnya disimpan (cache) di HP dan di database supaya tiap titik
 // cukup dicari satu kali.
 
-import { KnownVillage } from './geo';
+import { KnownVillage, haversineKm, normalizeVillage } from './geo';
 
 export interface GeoName { desa: string; kecamatan: string; }
 
@@ -65,41 +65,69 @@ export async function reverseGeocode(lat: number, lng: number): Promise<GeoName>
 
 // ---------- Daftar desa di sekitar depot (untuk "wilayah belum dikunjungi") ----------
 
-const VILLAGE_CACHE_PREFIX = 'esgaruda_villages_v1_';
+const VILLAGE_CACHE_PREFIX = 'esgaruda_villages_v2_';
 const VILLAGE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 hari
+
+// Beberapa server Overpass; kalau satu sibuk/menolak, dicoba yang berikutnya.
+export const OVERPASS_ENDPOINTS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter',
+];
+
+const villageCacheKey = (depotName: string, lat: number, lng: number, radiusKm: number) =>
+  `${VILLAGE_CACHE_PREFIX}${depotName}_${lat.toFixed(4)}_${lng.toFixed(4)}_${radiusKm}`;
 
 export function loadCachedVillages(depotName: string, lat: number, lng: number, radiusKm: number): KnownVillage[] | null {
   try {
-    const raw = localStorage.getItem(`${VILLAGE_CACHE_PREFIX}${depotName}_${lat.toFixed(4)}_${lng.toFixed(4)}_${radiusKm}`);
+    const raw = localStorage.getItem(villageCacheKey(depotName, lat, lng, radiusKm));
     if (!raw) return null;
     const p = JSON.parse(raw);
-    if (!p || Date.now() - p.at > VILLAGE_TTL_MS || !Array.isArray(p.list)) return null;
+    if (!p || Date.now() - p.at > VILLAGE_TTL_MS || !Array.isArray(p.list) || p.list.length === 0) return null;
     return p.list;
   } catch { return null; }
 }
 
-// Mengambil desa/kelurahan (admin_level 7 di OSM Indonesia) dalam radius dari depot.
-// Mengembalikan titik tengah tiap desa.
+async function overpassQuery(query: string): Promise<any> {
+  let lastErr: unknown = null;
+  for (const endpoint of OVERPASS_ENDPOINTS) {
+    try {
+      // application/x-www-form-urlencoded = permintaan "sederhana" (tanpa preflight CORS)
+      return await fetchJson(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'data=' + encodeURIComponent(query),
+      }, 30000);
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
+// Mengambil desa/kelurahan di sekitar depot dari titik place=village/suburb di OSM
+// (kotak koordinat, ringan, lalu disaring jaraknya di sini). Mengembalikan titik
+// tengah tiap desa. Hasil kosong dianggap gagal (tidak disimpan di cache).
 export async function fetchVillagesAround(depotName: string, lat: number, lng: number, radiusKm: number): Promise<KnownVillage[]> {
   const cached = loadCachedVillages(depotName, lat, lng, radiusKm);
   if (cached) return cached;
 
-  const around = `(around:${Math.round(radiusKm * 1000)},${lat},${lng})`;
-  const query = `[out:json][timeout:40];rel["boundary"="administrative"]["admin_level"="7"]${around};out tags center;`;
-  const json = await fetchJson(`${OVERPASS}?data=${encodeURIComponent(query)}`, undefined, 45000);
-  const seen = new Set<string>();
-  const list: KnownVillage[] = [];
+  const dLat = radiusKm / 111.195;
+  const dLng = radiusKm / (111.195 * Math.cos((lat * Math.PI) / 180));
+  const bbox = [lat - dLat, lng - dLng, lat + dLat, lng + dLng].map(n => n.toFixed(5)).join(',');
+  const query = `[out:json][timeout:25];(node["place"~"^(village|suburb)$"]["name"](${bbox}););out;`;
+  const json = await overpassQuery(query);
+
+  const byName = new Map<string, KnownVillage>();
   for (const el of (json && json.elements) || []) {
     const name = el.tags && (el.tags.name || el.tags['name:id']);
-    const c = el.center || (typeof el.lat === 'number' ? { lat: el.lat, lon: el.lon } : null);
-    if (!name || !c) continue;
-    const k = `${String(name).toLowerCase()}|${Number(c.lat).toFixed(3)}|${Number(c.lon).toFixed(3)}`;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    list.push({ name: String(name), lat: Number(c.lat), lng: Number(c.lon) });
+    const elLat = typeof el.lat === 'number' ? el.lat : el.center && el.center.lat;
+    const elLng = typeof el.lon === 'number' ? el.lon : el.center && el.center.lon;
+    if (!name || typeof elLat !== 'number' || typeof elLng !== 'number') continue;
+    if (haversineKm(lat, lng, elLat, elLng) > radiusKm) continue;
+    const key = normalizeVillage(name);
+    if (key && !byName.has(key)) byName.set(key, { name: String(name), lat: elLat, lng: elLng });
   }
-  try {
-    localStorage.setItem(`${VILLAGE_CACHE_PREFIX}${depotName}_${lat.toFixed(4)}_${lng.toFixed(4)}_${radiusKm}`, JSON.stringify({ at: Date.now(), list }));
-  } catch { /* abaikan */ }
+  const list = Array.from(byName.values());
+  if (list.length === 0) throw new Error('Server peta tidak mengembalikan daftar desa');
+  try { localStorage.setItem(villageCacheKey(depotName, lat, lng, radiusKm), JSON.stringify({ at: Date.now(), list })); } catch { /* abaikan */ }
   return list;
 }
